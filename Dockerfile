@@ -21,7 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git gnupg sudo \
       build-essential python3 python3-pip python3-venv \
-      ripgrep jq less unzip zip nano vim openssh-client \
+      ripgrep jq less unzip zip nano vim openssh-client rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js. NodeSource publishes native amd64 and arm64 builds, so this image
@@ -66,5 +66,7 @@ RUN git config --global --add safe.directory /workspace \
     && git config --global --add safe.directory '*' \
     && mkdir -p /home/sandboxuser/.claude /home/sandboxuser/.npm-global
 
+COPY --chown=sandboxuser:sandboxuser entrypoint.sh /usr/local/bin/ralph-entrypoint
 WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/ralph-entrypoint"]
 CMD ["/bin/bash"]

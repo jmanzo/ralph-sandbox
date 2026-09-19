@@ -3,3 +3,6 @@
 .env
 .env.*
 config.env
+
+# staged at build time from policy/default.allowlist
+proxy/default.allowlist

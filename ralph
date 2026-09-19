@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# ralph -- run a coding agent in autonomous ("yolo") mode inside a disposable
-# container, so a skipped permission prompt can't reach your machine.
+# ralph -- run a coding agent in autonomous ("yolo") mode inside a locked-down
+# container: deny-by-default egress, no host filesystem beyond one workspace,
+# no access to the host Docker daemon.
 #
 # https://github.com/jmanzo/ralph-sandbox
 #
@@ -19,22 +20,47 @@ done
 RALPH_ROOT="$(cd -P "$(dirname "$_self")" && pwd)"
 
 # ---------------------------------------------------------------------------
-# Config. Every value is overridable by env var, or by a config file at
-# ~/.config/ralph/config.env (or $RALPH_CONFIG).
+# Config. Every value is overridable by env var, or in the config file.
 # ---------------------------------------------------------------------------
-RALPH_CONFIG="${RALPH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ralph/config.env}"
+_cfg_home="${XDG_CONFIG_HOME:-$HOME/.config}/ralph"
+_data_home="${XDG_DATA_HOME:-$HOME/.local/share}/ralph"
+RALPH_CONFIG="${RALPH_CONFIG:-$_cfg_home/config.env}"
 # shellcheck disable=SC1090
 [ -f "$RALPH_CONFIG" ] && . "$RALPH_CONFIG"
 
 RALPH_IMAGE="${RALPH_IMAGE:-ralph-sandbox}"
+RALPH_PROXY_IMAGE="${RALPH_PROXY_IMAGE:-ralph-proxy}"
 RALPH_HOME_VOLUME="${RALPH_HOME_VOLUME:-ralph-home}"
 RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
-# The command run inside the container. Swap this to sandbox a different agent.
 RALPH_AGENT_CMD="${RALPH_AGENT_CMD:-claude --dangerously-skip-permissions}"
-RALPH_NETWORK="${RALPH_NETWORK:-bridge}"
-# Mount ~/.gitconfig read-only so commits made in the sandbox are attributed.
+
+# Workspace isolation, mirroring Docker Sandboxes:
+#   direct -- host workspace bind-mounted read-write (live, and destructible)
+#   clone  -- host workspace read-only, agent works in a private copy
+#   none   -- no host filesystem at all
+RALPH_MODE="${RALPH_MODE:-direct}"
+
+# Deny-by-default egress through the proxy sidecar.
+RALPH_NETWORK_POLICY="${RALPH_NETWORK_POLICY:-on}"
+RALPH_ALLOWLIST="${RALPH_ALLOWLIST:-$_cfg_home/allowlist}"
+RALPH_INTERNAL_NET="${RALPH_INTERNAL_NET:-ralph-internal}"
+RALPH_EGRESS_NET="${RALPH_EGRESS_NET:-ralph-egress}"
+RALPH_PROXY_NAME="${RALPH_PROXY_NAME:-ralph-proxy}"
+
+# Host-side snapshots, so direct mode is recoverable.
+RALPH_SNAPSHOT="${RALPH_SNAPSHOT:-on}"
+RALPH_SNAPSHOT_DIR="${RALPH_SNAPSHOT_DIR:-$_data_home/snapshots}"
+RALPH_SNAPSHOT_KEEP="${RALPH_SNAPSHOT_KEEP:-10}"
+
+# Blast-radius limits.
+RALPH_MEMORY="${RALPH_MEMORY:-}"
+RALPH_CPUS="${RALPH_CPUS:-}"
+RALPH_PIDS_LIMIT="${RALPH_PIDS_LIMIT:-2048}"
+# on = drop all capabilities and forbid privilege escalation. This also makes
+# `sudo` stop working, so package installs inside the sandbox will fail.
+RALPH_HARDEN="${RALPH_HARDEN:-off}"
+
 RALPH_MOUNT_GITCONFIG="${RALPH_MOUNT_GITCONFIG:-1}"
-# Off by default and deliberately so: see the security notes in the README.
 RALPH_MOUNT_SSH="${RALPH_MOUNT_SSH:-0}"
 RALPH_DOCKER_ARGS="${RALPH_DOCKER_ARGS:-}"
 
@@ -44,22 +70,265 @@ warn() { printf '\033[33mralph: %s\033[0m\n' "$*" >&2; }
 
 command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
 
-image_exists()  { docker image inspect  "$RALPH_IMAGE"       >/dev/null 2>&1; }
-volume_exists() { docker volume inspect "$RALPH_HOME_VOLUME" >/dev/null 2>&1; }
+image_exists()  { docker image inspect  "$1" >/dev/null 2>&1; }
+volume_exists() { docker volume inspect "$1" >/dev/null 2>&1; }
+net_exists()    { docker network inspect "$1" >/dev/null 2>&1; }
+proxy_running() { [ "$(docker inspect -f '{{.State.Running}}' "$RALPH_PROXY_NAME" 2>/dev/null)" = "true" ]; }
+
+# Does the proxy actually answer on the internal network? The proxy image is
+# Alpine, so busybox nc is already there and this costs almost nothing.
+proxy_reachable() {
+  docker run --rm --network "$RALPH_INTERNAL_NET" \
+    --entrypoint sh "$RALPH_PROXY_IMAGE" -c 'nc -z -w 3 proxy 8888' >/dev/null 2>&1
+}
+
+# A stable per-project identifier, used to name per-workspace volumes and to
+# file snapshots.
+project_id() {
+  printf '%s' "$RALPH_WORKSPACE" | cksum | awk '{print $1}'
+}
+project_slug() {
+  printf '%s-%s' "$(basename "$RALPH_WORKSPACE" | tr -c 'a-zA-Z0-9_.-' '-')" "$(project_id)"
+}
+ws_volume_name() {
+  case "$RALPH_MODE" in
+    none) printf 'ralph-box-%s' "$(project_slug)" ;;
+    *)    printf 'ralph-ws-%s'  "$(project_slug)" ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
-# Commands
+# Egress policy
 # ---------------------------------------------------------------------------
+ensure_allowlist() {
+  if [ ! -f "$RALPH_ALLOWLIST" ]; then
+    mkdir -p "$(dirname "$RALPH_ALLOWLIST")"
+    cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ALLOWLIST"
+    info "seeded egress policy at $RALPH_ALLOWLIST"
+  fi
+}
+
+proxy_up() {
+  ensure_allowlist
+  image_exists "$RALPH_PROXY_IMAGE" || build_proxy
+
+  net_exists "$RALPH_INTERNAL_NET" || docker network create --internal "$RALPH_INTERNAL_NET" >/dev/null
+  net_exists "$RALPH_EGRESS_NET"   || docker network create "$RALPH_EGRESS_NET" >/dev/null
+
+  if proxy_running; then return 0; fi
+  docker rm -f "$RALPH_PROXY_NAME" >/dev/null 2>&1 || true
+
+  info "starting egress proxy (deny-by-default)"
+  # create -> connect -> start. Attaching the second network to an already
+  # running container races against Docker setting up its network sandbox.
+  docker create --name "$RALPH_PROXY_NAME" \
+    --network "$RALPH_INTERNAL_NET" --network-alias proxy \
+    --restart unless-stopped \
+    -v "$RALPH_ALLOWLIST:/etc/tinyproxy/allowlist:ro" \
+    "$RALPH_PROXY_IMAGE" >/dev/null
+  docker network connect "$RALPH_EGRESS_NET" "$RALPH_PROXY_NAME"
+  docker start "$RALPH_PROXY_NAME" >/dev/null
+
+  # Fail loudly rather than silently running without a policy. Checking
+  # .State.Running is not enough: with a restart policy, a crash-looping
+  # container flickers through "running" between attempts. Probe the port.
+  local tries=0
+  until proxy_reachable; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 10 ]; then
+      docker logs --tail 20 "$RALPH_PROXY_NAME" >&2 || true
+      die "egress proxy is not accepting connections (see log above)"
+    fi
+    sleep 0.5
+  done
+}
+
+proxy_down() {
+  if docker rm -f "$RALPH_PROXY_NAME" >/dev/null 2>&1; then
+    info "egress proxy stopped"
+  else
+    info "egress proxy not running"
+  fi
+}
+
+cmd_policy() {
+  case "${1:-ls}" in
+    ls)
+      ensure_allowlist
+      printf 'policy file: %s\n\n' "$RALPH_ALLOWLIST"
+      grep -vE '^\s*(#|$)' "$RALPH_ALLOWLIST" || true
+      ;;
+    path)  ensure_allowlist; printf '%s\n' "$RALPH_ALLOWLIST" ;;
+    edit)
+      ensure_allowlist
+      "${EDITOR:-vi}" "$RALPH_ALLOWLIST"
+      proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
+      ;;
+    reset)
+      mkdir -p "$(dirname "$RALPH_ALLOWLIST")"
+      cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ALLOWLIST"
+      info "policy reset to defaults"
+      proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
+      ;;
+    test)
+      local host="${2:-}"
+      [ -n "$host" ] || die "usage: ralph policy test <hostname>"
+      proxy_up
+      docker run --rm --network "$RALPH_INTERNAL_NET" \
+        -e https_proxy="http://proxy:8888" "$RALPH_IMAGE" \
+        curl -s -o /dev/null -w "%{http_code}\n" --max-time 15 "https://$host" \
+        | { read -r code
+            if [ "$code" = "000" ]; then printf '%s: BLOCKED by policy\n' "$host"
+            else printf '%s: allowed (HTTP %s)\n' "$host" "$code"; fi; }
+      ;;
+    *) die "usage: ralph policy <ls|path|edit|reset|test HOST>" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Snapshots (host side, so the agent cannot reach them)
+# ---------------------------------------------------------------------------
+snapshot_store() { printf '%s/%s' "$RALPH_SNAPSHOT_DIR" "$(project_slug)"; }
+
+cmd_snapshot() {
+  case "${1:-create}" in
+    create) snapshot_create ;;
+    ls)
+      local store; store="$(snapshot_store)"
+      [ -d "$store" ] || { info "no snapshots for this workspace"; return 0; }
+      printf 'snapshots for %s\n\n' "$RALPH_WORKSPACE"
+      find "$store" -maxdepth 1 -name '*.bundle' 2>/dev/null | sort -r | while read -r b; do
+        printf '  %s  (%s)\n' "$(basename "$b" .bundle)" "$(du -h "$b" | awk '{print $1}')"
+      done
+      ;;
+    restore) snapshot_restore "${2:-}" ;;
+    *) die "usage: ralph snapshot <create|ls|restore [ID]>" ;;
+  esac
+}
+
+snapshot_create() {
+  [ "$RALPH_SNAPSHOT" = "on" ] || return 0
+  git -C "$RALPH_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1 || {
+    [ "${1:-}" = "quiet" ] || warn "workspace is not a git repo -- no snapshot taken"
+    return 0
+  }
+  git -C "$RALPH_WORKSPACE" rev-parse HEAD >/dev/null 2>&1 || {
+    [ "${1:-}" = "quiet" ] || warn "repo has no commits yet -- no snapshot taken"
+    return 0
+  }
+
+  local store ts tree commit idx
+  store="$(snapshot_store)"; mkdir -p "$store"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  idx="$(mktemp -t ralph-idx.XXXXXX)"; rm -f "$idx"
+
+  # Build the snapshot in a throwaway index so the user's staged changes and
+  # `git status` are left exactly as they were.
+  (
+    export GIT_INDEX_FILE="$idx"
+    git -C "$RALPH_WORKSPACE" read-tree HEAD
+    git -C "$RALPH_WORKSPACE" add -A
+  )
+  tree="$(GIT_INDEX_FILE="$idx" git -C "$RALPH_WORKSPACE" write-tree)"
+  rm -f "$idx"
+  commit="$(git -C "$RALPH_WORKSPACE" commit-tree "$tree" -p HEAD \
+              -m "ralph snapshot $ts")"
+  git -C "$RALPH_WORKSPACE" update-ref "refs/ralph/snapshots/$ts" "$commit"
+
+  # The ref alone lives in .git, which the agent can delete. The bundle is
+  # written outside the mount, where the sandbox has no reach.
+  git -C "$RALPH_WORKSPACE" bundle create "$store/$ts.bundle" \
+      --all "refs/ralph/snapshots/$ts" >/dev/null 2>&1 \
+    || git -C "$RALPH_WORKSPACE" bundle create "$store/$ts.bundle" "$commit" >/dev/null 2>&1
+
+  # Keep the store bounded.
+  find "$store" -maxdepth 1 -name '*.bundle' 2>/dev/null | sort -r \
+    | tail -n "+$((RALPH_SNAPSHOT_KEEP + 1))" | while read -r old; do
+    rm -f "$old"
+  done
+  info "snapshot $ts"
+}
+
+snapshot_restore() {
+  local id="$1" store bundle
+  store="$(snapshot_store)"
+  [ -d "$store" ] || die "no snapshots for this workspace"
+  if [ -z "$id" ]; then
+    bundle="$(find "$store" -maxdepth 1 -name '*.bundle' 2>/dev/null | sort -r | head -1)"
+    [ -n "$bundle" ] || die "no snapshots for this workspace"
+    id="$(basename "$bundle" .bundle)"
+  else
+    bundle="$store/$id.bundle"
+  fi
+  [ -f "$bundle" ] || die "no such snapshot: $id"
+
+  # The agent may have deleted .git outright -- that is the case this whole
+  # mechanism exists for, so rebuild a repo around the bundle rather than
+  # giving up.
+  if ! git -C "$RALPH_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1; then
+    warn ".git is missing -- reinitialising the repository from the snapshot"
+    git -C "$RALPH_WORKSPACE" init -q
+  fi
+
+  warn "restoring snapshot $id over $RALPH_WORKSPACE"
+  printf 'This overwrites current files. Continue? [y/N] ' >&2
+  read -r reply
+  case "$reply" in [yY]*) ;; *) die "aborted" ;; esac
+
+  # Fetch into a staging namespace first: git refuses to fetch directly into
+  # the branch that is currently checked out.
+  git -C "$RALPH_WORKSPACE" fetch -q "$bundle" \
+    '+refs/heads/*:refs/ralph/restored-heads/*' \
+    "+refs/ralph/snapshots/$id:refs/ralph/restored/$id"
+
+  # update-ref has no such restriction, so branches can be put back in place.
+  git -C "$RALPH_WORKSPACE" for-each-ref --format='%(refname) %(objectname)' \
+      refs/ralph/restored-heads \
+    | while read -r ref sha; do
+        git -C "$RALPH_WORKSPACE" update-ref \
+          "refs/heads/${ref#refs/ralph/restored-heads/}" "$sha"
+      done
+  git -C "$RALPH_WORKSPACE" for-each-ref --format='%(refname)' refs/ralph/restored-heads \
+    | while read -r ref; do git -C "$RALPH_WORKSPACE" update-ref -d "$ref"; done
+
+  # Put the files back, then unstage, so uncommitted work reappears as
+  # uncommitted work rather than as a staged blob.
+  git -C "$RALPH_WORKSPACE" checkout -q "refs/ralph/restored/$id" -- .
+  git -C "$RALPH_WORKSPACE" reset -q
+
+  info "restored snapshot $id"
+  info "working tree and history are back; review with: git status && git log"
+}
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+build_proxy() {
+  info "building $RALPH_PROXY_IMAGE"
+  # policy/default.allowlist is the single source of truth; stage a copy into
+  # the proxy build context so the two cannot drift.
+  cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ROOT/proxy/default.allowlist"
+  docker build -t "$RALPH_PROXY_IMAGE" "$RALPH_ROOT/proxy"
+}
+
 cmd_build() {
   info "building $RALPH_IMAGE"
   docker build "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+  build_proxy
 }
 
 cmd_update() {
-  info "rebuilding $RALPH_IMAGE with the latest agent release"
+  info "rebuilding from scratch with the latest agent"
   docker build --pull --no-cache "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+  cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ROOT/proxy/default.allowlist"
+  docker build --pull --no-cache -t "$RALPH_PROXY_IMAGE" "$RALPH_ROOT/proxy"
+  proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
+  return 0
 }
 
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
 cmd_run() {
   local entry=()
   case "${RALPH_ENTRY:-agent}" in
@@ -67,35 +336,74 @@ cmd_run() {
     *)     read -r -a entry <<<"$RALPH_AGENT_CMD" ;;
   esac
 
-  image_exists || { info "no $RALPH_IMAGE image yet, building it (one time)"; cmd_build; }
-  volume_exists || docker volume create "$RALPH_HOME_VOLUME" >/dev/null
+  image_exists "$RALPH_IMAGE" || { info "no image yet, building (one time)"; cmd_build; }
+  volume_exists "$RALPH_HOME_VOLUME" || docker volume create "$RALPH_HOME_VOLUME" >/dev/null
 
-  [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
+  local args=()
 
-  local mounts=(
-    -v "$RALPH_WORKSPACE:/workspace"
-    -v "$RALPH_HOME_VOLUME:/home/sandboxuser"
-  )
+  # --- workspace mode -----------------------------------------------------
+  # Clone and mountless workspaces are different things; keep them apart.
+  local ws_volume
+  ws_volume="$(ws_volume_name)"
+  case "$RALPH_MODE" in
+    direct)
+      [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
+      snapshot_create quiet
+      args+=(-v "$RALPH_WORKSPACE:/workspace")
+      ;;
+    clone)
+      [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
+      volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
+      args+=(-v "$RALPH_WORKSPACE:/run/sandbox/source:ro" -v "$ws_volume:/workspace")
+      ;;
+    none)
+      volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
+      args+=(-v "$ws_volume:/workspace")
+      ;;
+    *) die "unknown RALPH_MODE: $RALPH_MODE (expected direct, clone or none)" ;;
+  esac
+
+  args+=(-v "$RALPH_HOME_VOLUME:/home/sandboxuser")
+
+  # --- network policy -----------------------------------------------------
+  if [ "$RALPH_NETWORK_POLICY" = "on" ]; then
+    proxy_up
+    args+=(--network "$RALPH_INTERNAL_NET")
+    args+=(-e "http_proxy=http://proxy:8888"  -e "HTTP_PROXY=http://proxy:8888")
+    args+=(-e "https_proxy=http://proxy:8888" -e "HTTPS_PROXY=http://proxy:8888")
+    args+=(-e "no_proxy=localhost,127.0.0.1"  -e "NO_PROXY=localhost,127.0.0.1")
+  else
+    warn "network policy is OFF -- the sandbox has unrestricted internet access"
+    args+=(--network bridge)
+  fi
+
+  # --- blast-radius limits ------------------------------------------------
+  [ -n "$RALPH_PIDS_LIMIT" ] && args+=(--pids-limit "$RALPH_PIDS_LIMIT")
+  [ -n "$RALPH_MEMORY" ]     && args+=(--memory "$RALPH_MEMORY")
+  [ -n "$RALPH_CPUS" ]       && args+=(--cpus "$RALPH_CPUS")
+  if [ "$RALPH_HARDEN" = "on" ]; then
+    args+=(--cap-drop ALL --security-opt no-new-privileges)
+  fi
+
+  # --- optional host material --------------------------------------------
   if [ "$RALPH_MOUNT_GITCONFIG" = "1" ] && [ -f "$HOME/.gitconfig" ]; then
-    mounts+=(-v "$HOME/.gitconfig:/home/sandboxuser/.gitconfig:ro")
+    args+=(-v "$HOME/.gitconfig:/home/sandboxuser/.gitconfig:ro")
   fi
   if [ "$RALPH_MOUNT_SSH" = "1" ] && [ -d "$HOME/.ssh" ]; then
-    warn "mounting ~/.ssh into a yolo sandbox -- the agent can use your keys"
-    mounts+=(-v "$HOME/.ssh:/home/sandboxuser/.ssh:ro")
+    warn "mounting ~/.ssh -- the agent can use your keys"
+    args+=(-v "$HOME/.ssh:/home/sandboxuser/.ssh:ro")
   fi
 
-  # Only allocate a TTY when we actually have one, so `ralph run -p '...'`
-  # stays usable in pipes and CI.
   local tty=(-i)
   [ -t 0 ] && [ -t 1 ] && tty=(-it)
 
   local extra=()
   [ -n "$RALPH_DOCKER_ARGS" ] && read -r -a extra <<<"$RALPH_DOCKER_ARGS"
 
+  # Note: the host Docker socket is deliberately never mounted.
   exec docker run --rm "${tty[@]}" \
     --hostname ralph \
-    --network "$RALPH_NETWORK" \
-    "${mounts[@]}" \
+    "${args[@]}" \
     -w /workspace \
     -e TERM="${TERM:-xterm-256color}" \
     -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
@@ -106,81 +414,162 @@ cmd_run() {
 
 cmd_shell() { RALPH_ENTRY=shell cmd_run "$@"; }
 
+# ---------------------------------------------------------------------------
+# Clone-mode sync
+# ---------------------------------------------------------------------------
+cmd_diff() {
+  [ "$RALPH_MODE" = "clone" ] || die "diff applies to clone mode (RALPH_MODE=clone)"
+  local ws_volume; ws_volume="$(ws_volume_name)"
+  volume_exists "$ws_volume" || die "no sandbox workspace yet for $RALPH_WORKSPACE"
+  docker run --rm \
+    -v "$RALPH_WORKSPACE:/run/sandbox/source:ro" -v "$ws_volume:/workspace" \
+    --entrypoint diff "$RALPH_IMAGE" \
+    -ru --exclude=.git --exclude=.ralph-seeded /run/sandbox/source /workspace || true
+}
+
+cmd_apply() {
+  [ "$RALPH_MODE" = "clone" ] || die "apply applies to clone mode (RALPH_MODE=clone)"
+  local ws_volume; ws_volume="$(ws_volume_name)"
+  volume_exists "$ws_volume" || die "no sandbox workspace yet for $RALPH_WORKSPACE"
+  snapshot_create
+  warn "copying the sandbox workspace over $RALPH_WORKSPACE"
+  printf 'Continue? [y/N] ' >&2
+  read -r reply
+  case "$reply" in [yY]*) ;; *) die "aborted" ;; esac
+  docker run --rm \
+    -v "$RALPH_WORKSPACE:/run/sandbox/target" -v "$ws_volume:/workspace:ro" \
+    --entrypoint rsync "$RALPH_IMAGE" \
+    -a --exclude=.git --exclude=.ralph-seeded /workspace/ /run/sandbox/target/
+  info "applied. Review with: git status"
+}
+
+# ---------------------------------------------------------------------------
+# Status / clean / help
+# ---------------------------------------------------------------------------
 cmd_status() {
-  printf 'repo        %s\n' "$RALPH_ROOT"
-  printf 'workspace   %s\n' "$RALPH_WORKSPACE"
-  printf 'agent       %s\n' "$RALPH_AGENT_CMD"
-  printf 'network     %s\n' "$RALPH_NETWORK"
-  printf 'config      %s%s\n' "$RALPH_CONFIG" "$([ -f "$RALPH_CONFIG" ] || echo '  (none)')"
-  if image_exists; then
-    printf 'image       %s  %s\n' "$RALPH_IMAGE" \
-      "$(docker image inspect "$RALPH_IMAGE" --format '{{.Architecture}}, built {{.Created}}' 2>/dev/null)"
+  printf 'repo          %s\n' "$RALPH_ROOT"
+  printf 'workspace     %s\n' "$RALPH_WORKSPACE"
+  printf 'mode          %s' "$RALPH_MODE"
+  case "$RALPH_MODE" in
+    direct) printf '  (host files are live and writable)\n' ;;
+    clone)  printf '  (host files read-only; agent works in a private copy)\n' ;;
+    none)   printf '  (no host filesystem)\n' ;;
+  esac
+  printf 'agent         %s\n' "$RALPH_AGENT_CMD"
+  if [ "$RALPH_NETWORK_POLICY" = "on" ]; then
+    printf 'network       deny-by-default via proxy  (%s)\n' \
+      "$(proxy_running && echo 'proxy up' || echo 'proxy will start on run')"
+    printf 'policy        %s\n' "$RALPH_ALLOWLIST"
   else
-    printf 'image       %s  (not built, run: ralph build)\n' "$RALPH_IMAGE"
+    printf 'network       UNRESTRICTED\n'
   fi
-  if volume_exists; then
-    printf 'home volume %s  (holds the sandbox login)\n' "$RALPH_HOME_VOLUME"
+  printf 'hardened      %s\n' "$RALPH_HARDEN"
+  printf 'snapshots     %s  (%s)\n' "$RALPH_SNAPSHOT" "$(snapshot_store)"
+  printf 'config        %s%s\n' "$RALPH_CONFIG" "$([ -f "$RALPH_CONFIG" ] || echo '  (none)')"
+  if image_exists "$RALPH_IMAGE"; then
+    printf 'image         %s  %s\n' "$RALPH_IMAGE" \
+      "$(docker image inspect "$RALPH_IMAGE" --format '{{.Architecture}}' 2>/dev/null)"
   else
-    printf 'home volume %s  (not created -- you will log in on first run)\n' "$RALPH_HOME_VOLUME"
+    printf 'image         %s  (not built, run: ralph build)\n' "$RALPH_IMAGE"
   fi
+  volume_exists "$RALPH_HOME_VOLUME" \
+    && printf 'home volume   %s  (holds the sandbox login)\n' "$RALPH_HOME_VOLUME" \
+    || printf 'home volume   %s  (not created)\n' "$RALPH_HOME_VOLUME"
 }
 
 cmd_clean() {
-  local what="${1:-}"
-  case "$what" in
+  case "${1:-}" in
     volume)
-      volume_exists || { info "no volume to remove"; return 0; }
+      volume_exists "$RALPH_HOME_VOLUME" || { info "no home volume"; return 0; }
       warn "removing $RALPH_HOME_VOLUME -- this signs the sandbox out"
       docker volume rm "$RALPH_HOME_VOLUME"
       ;;
+    workspace)
+      local ws_volume; ws_volume="$(ws_volume_name)"
+      if volume_exists "$ws_volume"; then docker volume rm "$ws_volume"
+      else info "no sandbox workspace volume for $RALPH_WORKSPACE"; fi
+      ;;
     image)
-      if image_exists; then docker image rm "$RALPH_IMAGE"; else info "no image to remove"; fi
+      if image_exists "$RALPH_IMAGE"; then docker image rm "$RALPH_IMAGE"; else info "no image"; fi
+      if image_exists "$RALPH_PROXY_IMAGE"; then docker image rm "$RALPH_PROXY_IMAGE"; fi
+      ;;
+    proxy)
+      proxy_down
+      docker network rm "$RALPH_INTERNAL_NET" "$RALPH_EGRESS_NET" >/dev/null 2>&1 || true
       ;;
     all)
-      cmd_clean image || true
-      cmd_clean volume || true
+      cmd_clean proxy || true; cmd_clean image || true
+      cmd_clean workspace || true; cmd_clean volume || true
       ;;
-    *) die "usage: ralph clean <image|volume|all>" ;;
+    *) die "usage: ralph clean <image|volume|workspace|proxy|all>" ;;
+  esac
+}
+
+cmd_proxy() {
+  case "${1:-status}" in
+    up)     proxy_up; info "proxy up" ;;
+    down)   proxy_down ;;
+    logs)   docker logs -f "$RALPH_PROXY_NAME" ;;
+    status) proxy_running && echo "proxy: running" || echo "proxy: stopped" ;;
+    *) die "usage: ralph proxy <up|down|logs|status>" ;;
   esac
 }
 
 cmd_help() {
   cat <<'__HELP__'
-ralph -- run a coding agent in yolo mode inside a disposable container.
+ralph -- run a coding agent in yolo mode inside a locked-down container.
 
-USAGE
+COMMANDS
   ralph [run] [args...]   Launch the agent over the current directory (default)
   ralph shell [args...]   Open a shell in the sandbox instead
-  ralph build [docker..]  Build the image
-  ralph update            Rebuild from scratch, pulling the latest agent
-  ralph status            Show image, volume and config state
-  ralph clean <image|volume|all>
-  ralph help
+  ralph status            Show mode, network policy, images and volumes
+  ralph build [docker..]  Build the sandbox and proxy images
+  ralph update            Rebuild from scratch with the latest agent
+
+  ralph policy ls         Show the egress allowlist
+  ralph policy edit       Edit it, then restart the proxy
+  ralph policy test HOST  Check whether a host is reachable under the policy
+  ralph policy reset      Restore the shipped defaults
+
+  ralph snapshot ls       List host-side workspace snapshots
+  ralph snapshot create   Take one now
+  ralph snapshot restore [ID]   Roll the workspace back
+
+  ralph diff              Clone mode: what the agent changed
+  ralph apply             Clone mode: copy those changes onto the host
+
+  ralph proxy <up|down|logs|status>
+  ralph clean <image|volume|workspace|proxy|all>
 
 FIRST RUN
   ralph                   then type /login inside the agent.
   The login persists in a Docker volume, so you only do this once.
 
-CONFIG  (env vars, or ~/.config/ralph/config.env)
-  RALPH_IMAGE             image tag                 [ralph-sandbox]
-  RALPH_HOME_VOLUME       volume holding the login  [ralph-home]
-  RALPH_WORKSPACE         directory to mount        [$PWD]
-  RALPH_AGENT_CMD         command run inside        [claude --dangerously-skip-permissions]
-  RALPH_NETWORK           docker network            [bridge]
-  RALPH_MOUNT_GITCONFIG   mount ~/.gitconfig :ro    [1]
-  RALPH_MOUNT_SSH         mount ~/.ssh :ro          [0]
-  RALPH_DOCKER_ARGS       extra args for docker run [ ]
+KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
+  RALPH_MODE              direct | clone | none        [direct]
+  RALPH_NETWORK_POLICY    on | off                     [on]
+  RALPH_HARDEN            on | off (drops caps, breaks sudo)  [off]
+  RALPH_SNAPSHOT          on | off                     [on]
+  RALPH_AGENT_CMD         command run inside           [claude --dangerously-skip-permissions]
+  RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
+  RALPH_MOUNT_GITCONFIG   [1]      RALPH_MOUNT_SSH     [0]
+
+Run `ralph status` to see what is actually in effect.
 __HELP__
 }
 
 case "${1:-run}" in
-  run)     shift || true; cmd_run "$@" ;;
-  shell)   shift; cmd_shell "$@" ;;
-  build)   shift; cmd_build "$@" ;;
-  update)  shift; cmd_update "$@" ;;
-  status)  shift; cmd_status "$@" ;;
-  clean)   shift; cmd_clean "$@" ;;
+  run)      shift || true; cmd_run "$@" ;;
+  shell)    shift; cmd_shell "$@" ;;
+  build)    shift; cmd_build "$@" ;;
+  update)   shift; cmd_update "$@" ;;
+  status)   shift; cmd_status "$@" ;;
+  policy)   shift; cmd_policy "$@" ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
+  proxy)    shift; cmd_proxy "$@" ;;
+  diff)     shift; cmd_diff "$@" ;;
+  apply)    shift; cmd_apply "$@" ;;
+  clean)    shift; cmd_clean "$@" ;;
   help|-h|--help) cmd_help ;;
-  # Anything else is agent arguments: `ralph -p "fix the build"`.
-  *)       cmd_run "$@" ;;
+  *)        cmd_run "$@" ;;
 esac

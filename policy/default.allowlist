@@ -1,0 +1,32 @@
+# ralph egress policy -- deny by default.
+#
+# One extended regular expression per line, matched against the destination
+# hostname. Anchor with ^...$ so that a rule for `github.com` cannot be matched
+# by `github.com.attacker.example`.
+#
+# Edit with `ralph policy edit`, inspect with `ralph policy ls`.
+# Keep this list as small as your work allows.
+
+# --- Agent API and authentication (required) ---
+^api\.anthropic\.com$
+^console\.anthropic\.com$
+^claude\.ai$
+^statsig\.anthropic\.com$
+
+# --- Package registries ---
+^registry\.npmjs\.org$
+^pypi\.org$
+^files\.pythonhosted\.org$
+
+# --- Source hosting ---
+^github\.com$
+^api\.github\.com$
+^codeload\.github\.com$
+^objects\.githubusercontent\.com$
+^raw\.githubusercontent\.com$
+
+# --- OS packages (needed to install things inside the sandbox) ---
+^archive\.ubuntu\.com$
+^security\.ubuntu\.com$
+^ports\.ubuntu\.com$
+^deb\.nodesource\.com$
