@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# ralph -- run a coding agent in autonomous ("yolo") mode inside a disposable
+# container, so a skipped permission prompt can't reach your machine.
+#
+# https://github.com/jmanzo/ralph-sandbox
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Locate the repo, following symlinks so `ralph` works from anywhere on $PATH.
+# ---------------------------------------------------------------------------
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _dir="$(cd -P "$(dirname "$_self")" && pwd)"
+  _self="$(readlink "$_self")"
+  [[ "$_self" != /* ]] && _self="$_dir/$_self"
+done
+RALPH_ROOT="$(cd -P "$(dirname "$_self")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# Config. Every value is overridable by env var, or by a config file at
+# ~/.config/ralph/config.env (or $RALPH_CONFIG).
+# ---------------------------------------------------------------------------
+RALPH_CONFIG="${RALPH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ralph/config.env}"
+# shellcheck disable=SC1090
+[ -f "$RALPH_CONFIG" ] && . "$RALPH_CONFIG"
+
+RALPH_IMAGE="${RALPH_IMAGE:-ralph-sandbox}"
+RALPH_HOME_VOLUME="${RALPH_HOME_VOLUME:-ralph-home}"
+RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
+# The command run inside the container. Swap this to sandbox a different agent.
+RALPH_AGENT_CMD="${RALPH_AGENT_CMD:-claude --dangerously-skip-permissions}"
+RALPH_NETWORK="${RALPH_NETWORK:-bridge}"
+# Mount ~/.gitconfig read-only so commits made in the sandbox are attributed.
+RALPH_MOUNT_GITCONFIG="${RALPH_MOUNT_GITCONFIG:-1}"
+# Off by default and deliberately so: see the security notes in the README.
+RALPH_MOUNT_SSH="${RALPH_MOUNT_SSH:-0}"
+RALPH_DOCKER_ARGS="${RALPH_DOCKER_ARGS:-}"
+
+die()  { printf 'ralph: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[2m==> %s\033[0m\n' "$*" >&2; }
+warn() { printf '\033[33mralph: %s\033[0m\n' "$*" >&2; }
+
+command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+
+image_exists()  { docker image inspect  "$RALPH_IMAGE"       >/dev/null 2>&1; }
+volume_exists() { docker volume inspect "$RALPH_HOME_VOLUME" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_build() {
+  info "building $RALPH_IMAGE"
+  docker build "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+}
+
+cmd_update() {
+  info "rebuilding $RALPH_IMAGE with the latest agent release"
+  docker build --pull --no-cache "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+}
+
+cmd_run() {
+  local entry=()
+  case "${RALPH_ENTRY:-agent}" in
+    shell) entry=(/bin/bash) ;;
+    *)     read -r -a entry <<<"$RALPH_AGENT_CMD" ;;
+  esac
+
+  image_exists || { info "no $RALPH_IMAGE image yet, building it (one time)"; cmd_build; }
+  volume_exists || docker volume create "$RALPH_HOME_VOLUME" >/dev/null
+
+  [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
+
+  local mounts=(
+    -v "$RALPH_WORKSPACE:/workspace"
+    -v "$RALPH_HOME_VOLUME:/home/sandboxuser"
+  )
+  if [ "$RALPH_MOUNT_GITCONFIG" = "1" ] && [ -f "$HOME/.gitconfig" ]; then
+    mounts+=(-v "$HOME/.gitconfig:/home/sandboxuser/.gitconfig:ro")
+  fi
+  if [ "$RALPH_MOUNT_SSH" = "1" ] && [ -d "$HOME/.ssh" ]; then
+    warn "mounting ~/.ssh into a yolo sandbox -- the agent can use your keys"
+    mounts+=(-v "$HOME/.ssh:/home/sandboxuser/.ssh:ro")
+  fi
+
+  # Only allocate a TTY when we actually have one, so `ralph run -p '...'`
+  # stays usable in pipes and CI.
+  local tty=(-i)
+  [ -t 0 ] && [ -t 1 ] && tty=(-it)
+
+  local extra=()
+  [ -n "$RALPH_DOCKER_ARGS" ] && read -r -a extra <<<"$RALPH_DOCKER_ARGS"
+
+  exec docker run --rm "${tty[@]}" \
+    --hostname ralph \
+    --network "$RALPH_NETWORK" \
+    "${mounts[@]}" \
+    -w /workspace \
+    -e TERM="${TERM:-xterm-256color}" \
+    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
+    -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}" \
+    ${extra[@]+"${extra[@]}"} \
+    "$RALPH_IMAGE" "${entry[@]}" "$@"
+}
+
+cmd_shell() { RALPH_ENTRY=shell cmd_run "$@"; }
+
+cmd_status() {
+  printf 'repo        %s\n' "$RALPH_ROOT"
+  printf 'workspace   %s\n' "$RALPH_WORKSPACE"
+  printf 'agent       %s\n' "$RALPH_AGENT_CMD"
+  printf 'network     %s\n' "$RALPH_NETWORK"
+  printf 'config      %s%s\n' "$RALPH_CONFIG" "$([ -f "$RALPH_CONFIG" ] || echo '  (none)')"
+  if image_exists; then
+    printf 'image       %s  %s\n' "$RALPH_IMAGE" \
+      "$(docker image inspect "$RALPH_IMAGE" --format '{{.Architecture}}, built {{.Created}}' 2>/dev/null)"
+  else
+    printf 'image       %s  (not built, run: ralph build)\n' "$RALPH_IMAGE"
+  fi
+  if volume_exists; then
+    printf 'home volume %s  (holds the sandbox login)\n' "$RALPH_HOME_VOLUME"
+  else
+    printf 'home volume %s  (not created -- you will log in on first run)\n' "$RALPH_HOME_VOLUME"
+  fi
+}
+
+cmd_clean() {
+  local what="${1:-}"
+  case "$what" in
+    volume)
+      volume_exists || { info "no volume to remove"; return 0; }
+      warn "removing $RALPH_HOME_VOLUME -- this signs the sandbox out"
+      docker volume rm "$RALPH_HOME_VOLUME"
+      ;;
+    image)
+      if image_exists; then docker image rm "$RALPH_IMAGE"; else info "no image to remove"; fi
+      ;;
+    all)
+      cmd_clean image || true
+      cmd_clean volume || true
+      ;;
+    *) die "usage: ralph clean <image|volume|all>" ;;
+  esac
+}
+
+cmd_help() {
+  cat <<'__HELP__'
+ralph -- run a coding agent in yolo mode inside a disposable container.
+
+USAGE
+  ralph [run] [args...]   Launch the agent over the current directory (default)
+  ralph shell [args...]   Open a shell in the sandbox instead
+  ralph build [docker..]  Build the image
+  ralph update            Rebuild from scratch, pulling the latest agent
+  ralph status            Show image, volume and config state
+  ralph clean <image|volume|all>
+  ralph help
+
+FIRST RUN
+  ralph                   then type /login inside the agent.
+  The login persists in a Docker volume, so you only do this once.
+
+CONFIG  (env vars, or ~/.config/ralph/config.env)
+  RALPH_IMAGE             image tag                 [ralph-sandbox]
+  RALPH_HOME_VOLUME       volume holding the login  [ralph-home]
+  RALPH_WORKSPACE         directory to mount        [$PWD]
+  RALPH_AGENT_CMD         command run inside        [claude --dangerously-skip-permissions]
+  RALPH_NETWORK           docker network            [bridge]
+  RALPH_MOUNT_GITCONFIG   mount ~/.gitconfig :ro    [1]
+  RALPH_MOUNT_SSH         mount ~/.ssh :ro          [0]
+  RALPH_DOCKER_ARGS       extra args for docker run [ ]
+__HELP__
+}
+
+case "${1:-run}" in
+  run)     shift || true; cmd_run "$@" ;;
+  shell)   shift; cmd_shell "$@" ;;
+  build)   shift; cmd_build "$@" ;;
+  update)  shift; cmd_update "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  clean)   shift; cmd_clean "$@" ;;
+  help|-h|--help) cmd_help ;;
+  # Anything else is agent arguments: `ralph -p "fix the build"`.
+  *)       cmd_run "$@" ;;
+esac
