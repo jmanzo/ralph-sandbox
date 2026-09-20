@@ -183,6 +183,12 @@ jobs:
           rm -rf /tmp/gitproj && mkdir -p /tmp/gitproj && cd /tmp/gitproj
           git init -q . && git config user.email t@t && git config user.name t
           echo hello > f.txt && git add -A && git commit -qm first
+          # The sandbox shares the uid of whoever built it, so a workspace this
+          # runner created would match it and never reach the ownership check.
+          # Give it away to a uid nobody has, and make it writable anyway --
+          # otherwise git fails on permissions before safe.directory matters.
+          sudo chown -R 12345:12345 /tmp/gitproj
+          sudo chmod -R a+rwX /tmp/gitproj
           printf '[user]\n\tname = Host User\n\temail = host@example.com\n' > /tmp/hostgitconfig
           out=$(docker run --rm -v /tmp/gitproj:/workspace \
                   -v /tmp/hostgitconfig:/home/sandboxuser/.gitconfig:ro \
