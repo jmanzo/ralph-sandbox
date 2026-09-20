@@ -10,8 +10,13 @@ your host, one bad command is your dotfiles, your SSH keys, or your other
 repositories -- and an agent with open internet can send anything it reads
 anywhere. `ralph` puts the agent somewhere it can only reach what you gave it.
 
-It is a Dockerfile, a proxy config, and one shell script. No daemon, no service,
+It is a Dockerfile, a proxy config, and two shell scripts. No daemon, no service,
 nothing to trust that you can't read in ten minutes.
+
+On top of that boundary it runs [Ralph](https://www.aihero.dev/getting-started-with-ralph):
+the same prompt, at the same agent, over and over, one task per iteration, until
+a PRD you wrote is satisfied. `ralph loop` is the part you leave running; the
+sandbox is what makes leaving it running reasonable.
 
 ## Relationship to Docker Sandboxes
 
@@ -64,6 +69,197 @@ complete the flow. **You only do this once** -- credentials live in a Docker vol
 that persists across runs, rebuilds, and projects.
 
 Run `ralph status` at any time to see exactly what is in effect.
+
+## The loop
+
+```bash
+cd ~/code/your-project
+ralph init            # scaffold the PRD, the prompt, the state files, the subagents
+$EDITOR PRD.md        # the only file you have to write by hand
+ralph loop            # until the PRD is done, unattended
+```
+
+There is no iteration count to pick. The run ends when the PRD is satisfied, or
+when one of the guardrails below decides it is not going to be. `ralph loop 10`
+still caps it, for when you want to sample the behaviour rather than finish.
+
+### What `ralph init` lays down
+
+```
+PRD.md                       what you're building, and how a machine can tell it's done
+PROPOSALS.md                 ideas the loop found but didn't build -- yours to promote
+CLAUDE.md                    conventions, plus the rules every agent in the loop follows
+.ralph/PROMPT.md             the orchestrator's prompt, run fresh every iteration
+.ralph/plan.md               the architect's ordered task list
+.ralph/progress.md           append-only log -- the loop's memory between iterations
+.claude/agents/architect.md
+.claude/agents/developer.md
+.claude/agents/qa.md
+```
+
+It never overwrites a file you already have. `ralph init --force` does.
+
+### The shape of an iteration
+
+Every iteration is a *fresh* agent session that remembers nothing. The top-level
+session is the orchestrator; it delegates to three subagents, each with its own
+context window:
+
+```
+                    orchestrator              plans, picks ONE task,
+                         |                    commits, writes the log
+           +-------------+-------------+
+           v             v             v
+       architect     developer         qa      separate sessions,
+       designs and   writes the        runs the verification,
+       orders the    code and the      reports failures
+       plan          tests             precisely
+```
+
+The division of labour is enforced by tooling, not just by prompt. The architect
+may write only `.ralph/plan.md`, so design pressure can't be resolved by quietly
+patching something. QA has no edit tools at all, so it can't fix what it was
+supposed to report -- finding and fixing in one pass is how a loop convinces
+itself it succeeded. And Claude Code subagents can't spawn subagents, so the tree
+is exactly this deep: no runaway fan-out while you're asleep.
+
+Between iterations the only things that survive are the git history and
+`.ralph/progress.md`. That's the whole discipline: context an agent didn't write
+down is context the next iteration doesn't have.
+
+### What it noticed but didn't build
+
+An agent held to one task will keep seeing things it was not asked to do. Left
+unmanaged those become scope creep; suppressed entirely, they are simply lost.
+They go to `PROPOSALS.md` instead.
+
+The developer and QA report what they saw; the orchestrator files it with the
+observation that prompted it, its rough size, and what it costs to keep
+ignoring it. Nothing there is implemented, and the loop never promotes anything
+into `PRD.md` -- that move is yours:
+
+```bash
+ralph loop                      # ... runs, finishes, or stops
+$EDITOR PROPOSALS.md            # read the shortlist
+# move what you want into PRD.md, delete it from PROPOSALS.md, run again
+```
+
+Two details that matter for an uncapped run. A proposal has to cite something
+that actually happened, not a best practice -- otherwise the file fills with
+boilerplate every night. And there is an *Already considered* section: ideas you
+declined go there, and the loop stops raising them.
+
+When a run finishes the PRD, the orchestrator's last act is to tidy the file --
+merge duplicates, drop what the finished work made moot, order by value. It is
+the one artefact of the run a human reads end to end, so it should read like a
+shortlist rather than a log.
+
+### Who runs on what
+
+Spending is concentrated where the reasoning happens, not where the routing
+does:
+
+| Role | Model | Set in |
+| --- | --- | --- |
+| Orchestrator | `haiku` | `RALPH_MODEL_ORCHESTRATOR` |
+| Architect | `sonnet` | `.claude/agents/architect.md` |
+| Developer | `opus` | `.claude/agents/developer.md` |
+| QA | `sonnet` | `.claude/agents/qa.md` |
+
+```bash
+ralph model                      # what each role is running on right now
+ralph model developer sonnet     # start an MVP cheap
+ralph model developer opus       # escalate when the logic gets intricate
+```
+
+**Degrading deliberately.** For an MVP, run the developer on `sonnet` too and
+leave it there while the work is CRUD-shaped. Escalate to `opus` on evidence --
+intricate domain logic, a third-party integration failing in new ways each time,
+or the same signature coming back from QA more than once. Escalate the
+*developer* first: it is rarely the architect that is underpowered.
+
+One caveat worth knowing before you leave it running: the orchestrator is the
+role that decides the PRD is done and emits the completion sigil. On `haiku`
+that is the cheapest seat in the tree and also the one whose misjudgement is
+least recoverable. If a run ends suspiciously early, raise that one first.
+
+### Three strikes on the same failure
+
+Two agents trading one bug back and forth is the most expensive way for an
+unattended loop to achieve nothing. So the same failure gets **three attempts
+across the whole run** -- not three per iteration:
+
+- The **developer** is told how many attempts are left, and that attempt 3 is
+  the last anybody pays for.
+- **QA** reports whether a failure is the same one as last time, and whether the
+  last attempt changed the output at all.
+- The **orchestrator**, on giving up, ends its turn with a failure signature:
+  `<blocked>npm test -- auth.spec.ts: expected 401, received 500</blocked>`.
+
+The loop compares those signatures literally. Three identical ones running and
+it halts with exit `4` and alerts you, instead of buying another night of the
+same bug. A genuinely different failure resets the count.
+
+### Notifications
+
+Set any of these -- each one that is set gets a copy:
+
+```bash
+export RALPH_SLACK_WEBHOOK=https://hooks.slack.com/services/...
+export RALPH_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+export RALPH_TELEGRAM_TOKEN=123456:ABC...   # and the chat to send to
+export RALPH_TELEGRAM_CHAT=-1001234567890
+
+ralph loop
+```
+
+One message per run, not per iteration: how it ended, how many iterations it
+took, what it cost, and what it was stuck on. `RALPH_NOTIFY_ON=problem` sends
+only when a run ends badly; the default `always` also tells you when the PRD is
+finished, which is the message you actually want overnight.
+
+**They are posted by the host, after the container exits.** The sandbox writes
+`.ralph/alert.txt` and nothing more. So no webhook URL and no bot token ever
+enters the sandbox, and none of these services go on the egress allowlist -- an
+allowlisted webhook is an exfiltration channel, and this buys the alerting
+without opening one.
+
+### When the loop stops
+
+| Exit | Why |
+| --- | --- |
+| `0` | The agent emitted `<promise>COMPLETE</promise>` -- the PRD is done |
+| `1` | The agent process itself failed twice running (`RALPH_LOOP_FAILS`) |
+| `2` | Three iterations running changed nothing (`RALPH_LOOP_STALL`) |
+| `3` | An explicit iteration cap ran out (only if you passed one) |
+| `4` | The same failure came back three iterations running (`RALPH_LOOP_REPEAT`) |
+| `5` | Spending passed `RALPH_LOOP_MAX_COST` |
+
+Uncapped does not mean unbounded: `2`, `4` and `5` are what actually stop a run
+that is not going to finish. If you want a hard ceiling in dollars rather than
+iterations, that is `RALPH_LOOP_MAX_COST=25`.
+
+The stall detector is the one that saves money. Each round it fingerprints
+`HEAD`, the working-tree diff and `progress.md`; a loop that is narrating rather
+than working gets stopped instead of billing you for another seven turns of it.
+The completion sigil is only honoured in the agent's *final* message, so an
+iteration that merely quotes its own instructions doesn't end the run.
+
+Full JSONL transcripts land in `.ralph/logs/`, one per iteration, with the cost
+of each. The whole run is one container and **one** snapshot, not one per
+iteration.
+
+### Reviewing before anything lands
+
+```bash
+RALPH_MODE=clone ralph loop      # the loop works on a private copy
+ralph diff                       # read everything it did
+ralph apply                      # land it, snapshotting first
+```
+
+Run `ralph init` before the first clone-mode launch. The private copy is seeded
+from your workspace once and then left alone, so files added afterwards don't
+appear in it -- `ralph clean workspace` reseeds if you get the order wrong.
 
 ## Workspace modes
 
@@ -159,6 +355,9 @@ RALPH_MEMORY=8g RALPH_CPUS=4 ralph
 
 ```
 ralph [run] [args...]   Launch the agent over the current directory (default)
+ralph init [--force]    Scaffold the loop: PRD, prompt, state, subagents
+ralph loop [N]          Run until the PRD is done (N caps the iterations)
+ralph model [role model]  Show, or change, the model behind each role
 ralph shell             Open a shell in the sandbox
 ralph status            Mode, network policy, images, volumes
 ralph build / update    Build images / rebuild with the latest agent
@@ -184,6 +383,17 @@ Environment variables, or `~/.config/ralph/config.env`:
 | `RALPH_MEMORY` / `RALPH_CPUS` | -- | Resource limits |
 | `RALPH_PIDS_LIMIT` | `2048` | Process cap |
 | `RALPH_AGENT_CMD` | `claude --dangerously-skip-permissions` | Command run inside |
+| `RALPH_LOOP_MAX` | `0` | Iteration cap; `0` means run until the PRD is done |
+| `RALPH_LOOP_MAX_COST` | -- | Stop once a run has spent this much (USD) |
+| `RALPH_LOOP_STALL` | `3` | Stop after this many iterations that change nothing |
+| `RALPH_LOOP_FAILS` | `2` | Stop after this many consecutive agent failures |
+| `RALPH_LOOP_SLEEP` | `0` | Seconds to pause between iterations |
+| `RALPH_LOOP_REPEAT` | `3` | Halt after this many repeats of one failure |
+| `RALPH_MODEL_ORCHESTRATOR` | `haiku` | Model behind the orchestrator |
+| `RALPH_SLACK_WEBHOOK` | -- | Slack incoming webhook |
+| `RALPH_DISCORD_WEBHOOK` | -- | Discord webhook |
+| `RALPH_TELEGRAM_TOKEN` / `_CHAT` | -- | Telegram bot token and chat id |
+| `RALPH_NOTIFY_ON` | `always` | `always`, or `problem` for bad endings only |
 | `RALPH_IMAGE` | `ralph-sandbox` | Image tag |
 | `RALPH_HOME_VOLUME` | `ralph-home` | Volume holding the login |
 | `RALPH_WORKSPACE` | `$PWD` | Directory to sandbox |
@@ -245,6 +455,13 @@ Worth reading before you rely on this.
   it so the agent can push, use a key scoped to that.
 - **The allowlist is only as tight as you make it.** Anything reachable is a
   possible destination for your source code.
+- **An unattended loop is still an unattended loop.** The budget, the stall
+  detector, the three-strikes rule and the sandbox bound what it can cost and
+  reach; they cannot make it right. Read the diff before you ship it.
+- **The three-strikes rule trusts the orchestrator's signature.** A model that
+  rephrases the same failure each time defeats the check, which is why the
+  prompt is emphatic about copying it verbatim. The iteration budget is the
+  backstop that does not depend on the model behaving.
 
 ## Troubleshooting
 
@@ -273,7 +490,7 @@ warning-free:
 
 ```bash
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable \
-  ralph install.sh yolo-run.sh entrypoint.sh
+  ralph install.sh yolo-run.sh entrypoint.sh loop.sh
 ```
 
 ## License

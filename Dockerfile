@@ -52,6 +52,13 @@ RUN userdel -r ubuntu 2>/dev/null || true; \
     && echo "sandboxuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sandboxuser \
     && chmod 0440 /etc/sudoers.d/sandboxuser
 
+# /workspace is a bind mount whose owner won't match on every host. This has to
+# live in the SYSTEM config: RALPH_MOUNT_GITCONFIG mounts the host's
+# ~/.gitconfig over the user's, which would shadow anything set with --global
+# and leave every git command failing with "detected dubious ownership".
+RUN git config --system --add safe.directory /workspace \
+    && git config --system --add safe.directory '*'
+
 # Agents refuse to run in yolo mode as root, so the sandbox user is mandatory,
 # not a nicety.
 USER sandboxuser
@@ -61,12 +68,12 @@ ENV HOME=/home/sandboxuser \
     npm_config_prefix=/home/sandboxuser/.npm-global \
     PATH=/home/sandboxuser/.npm-global/bin:/home/sandboxuser/.local/bin:$PATH
 
-# /workspace is a bind mount whose owner won't match on every host.
-RUN git config --global --add safe.directory /workspace \
-    && git config --global --add safe.directory '*' \
-    && mkdir -p /home/sandboxuser/.claude /home/sandboxuser/.npm-global
+RUN mkdir -p /home/sandboxuser/.claude /home/sandboxuser/.npm-global
 
 COPY --chown=sandboxuser:sandboxuser entrypoint.sh /usr/local/bin/ralph-entrypoint
+# The Ralph loop driver. `ralph loop` runs this instead of handing the agent
+# a terminal, so the whole run is one container.
+COPY --chown=sandboxuser:sandboxuser loop.sh /usr/local/bin/ralph-loop
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/ralph-entrypoint"]
 CMD ["/bin/bash"]
