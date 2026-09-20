@@ -1,0 +1,50 @@
+# ralph egress policy -- deny by default.
+#
+# One extended regular expression per line, matched against the destination
+# hostname. Anchor with ^...$ so that a rule for `github.com` cannot be matched
+# by `github.com.attacker.example`.
+#
+# Edit with `ralph policy edit`, inspect with `ralph policy ls`.
+# Keep this list as small as your work allows.
+
+# --- Agent API and authentication (required) ---
+# platform.claude.com handles OAuth token exchange, refresh and revocation for
+# BOTH Console and claude.ai logins, and the first-run connectivity check pings
+# it directly. Without it Claude Code fails to start with a 403 from this proxy.
+^api\.anthropic\.com$
+^platform\.claude\.com$
+^claude\.ai$
+^claude\.com$
+^console\.anthropic\.com$
+^statsig\.anthropic\.com$
+
+# --- Optional Claude Code hosts (uncomment only if you need them) ---
+# claude.ai MCP connectors, which are on by default for claude.ai logins.
+# Leave blocked and set ENABLE_CLAUDEAI_MCP_SERVERS=false to avoid the retries.
+#^mcp-proxy\.anthropic\.com$
+# Plugin downloads, native installer and auto-update checks.
+#^downloads\.claude\.ai$
+# Docs lookups by the built-in claude-code-guide agent.
+#^code\.claude\.com$
+# Operational telemetry and error reports. Blocked here by design; also set
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 so nothing waits on them.
+#^http-intake\.logs\.us5\.datadoghq\.com$
+#^browser-intake-us5-datadoghq\.com$
+
+# --- Package registries ---
+^registry\.npmjs\.org$
+^pypi\.org$
+^files\.pythonhosted\.org$
+
+# --- Source hosting ---
+^github\.com$
+^api\.github\.com$
+^codeload\.github\.com$
+^objects\.githubusercontent\.com$
+^raw\.githubusercontent\.com$
+
+# --- OS packages (needed to install things inside the sandbox) ---
+^archive\.ubuntu\.com$
+^security\.ubuntu\.com$
+^ports\.ubuntu\.com$
+^deb\.nodesource\.com$

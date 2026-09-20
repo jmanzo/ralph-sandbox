@@ -1,0 +1,111 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck ralph install.sh yolo-run.sh entrypoint.sh
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    name: build (${{ matrix.arch }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: ./ralph build
+
+      - name: Sandbox is a non-root user with the expected toolchain
+        run: |
+          docker run --rm ralph-sandbox bash -lc '
+            set -e
+            # On Linux the sandbox is built with the uid of whoever ran
+            # the build, so the guarantee is non-root, not a fixed number.
+            # Keep apostrophes out of this script: it is single-quoted.
+            test "$(id -u)" != 0
+            test "$(whoami)" = sandboxuser
+            node --version && claude --version && git --version
+            rg --version >/dev/null && rsync --version >/dev/null
+          '
+
+      - name: Yolo mode must refuse to run as root
+        run: |
+          out=$(docker run --rm --user root -e HOME=/root ralph-sandbox \
+                  bash -lc 'claude --dangerously-skip-permissions -p hi 2>&1' || true)
+          echo "$out"
+          echo "$out" | grep -q "cannot be used with root"
+
+      - name: Egress policy allows the allowlist and denies everything else
+        run: |
+          ./ralph proxy up
+          ./ralph policy test api.anthropic.com | tee /tmp/a
+          grep -q "allowed" /tmp/a
+          ./ralph policy test pastebin.com | tee /tmp/b
+          grep -q "BLOCKED" /tmp/b
+
+      - name: Egress is blocked at the route level, not just DNS
+        run: |
+          # A raw IP bypasses DNS entirely; the internal network must still
+          # have no way out.
+          docker run --rm --network ralph-internal ralph-sandbox \
+            curl -s -o /dev/null --max-time 8 https://1.1.1.1 \
+            && { echo "raw-IP egress succeeded, policy is broken"; exit 1; } \
+            || echo "raw-IP egress blocked"
+
+      - name: Host Docker socket is never exposed
+        run: |
+          docker run --rm ralph-sandbox bash -lc '
+            test ! -e /var/run/docker.sock || { echo "socket exposed"; exit 1; }
+          '
+
+      - name: Hardened mode drops all capabilities
+        run: |
+          caps=$(docker run --rm --cap-drop ALL --security-opt no-new-privileges \
+                   ralph-sandbox bash -lc 'grep CapEff /proc/self/status')
+          echo "$caps"
+          echo "$caps" | grep -q "0000000000000000"
+
+      - name: Clone mode keeps the host workspace read-only
+        run: |
+          mkdir -p /tmp/proj && echo original > /tmp/proj/file.txt
+          out=$(RALPH_MODE=clone RALPH_WORKSPACE=/tmp/proj RALPH_NETWORK_POLICY=off \
+                  ./ralph shell -lc 'touch /run/sandbox/source/hack 2>&1 || true')
+          echo "$out"
+          echo "$out" | grep -qi "read-only"
+          test "$(cat /tmp/proj/file.txt)" = original
+
+      - name: Snapshots survive deletion of the whole workspace
+        run: |
+          rm -rf /tmp/snap && mkdir -p /tmp/snap && cd /tmp/snap
+          git init -q . && git config user.email t@t && git config user.name t
+          echo v1 > app.txt && git add -A && git commit -qm first
+          echo uncommitted >> app.txt && echo draft > untracked.txt
+          before=$(git status --short)
+
+          RALPH_WORKSPACE=/tmp/snap RALPH_NETWORK_POLICY=off \
+            "$GITHUB_WORKSPACE/ralph" shell -lc 'rm -rf /workspace/.git /workspace/*'
+
+          test ! -e /tmp/snap/app.txt
+          yes | RALPH_WORKSPACE=/tmp/snap "$GITHUB_WORKSPACE/ralph" snapshot restore
+
+          after=$(git status --short)
+          echo "before: $before"
+          echo "after:  $after"
+          test "$before" = "$after"
+          test "$(git log --oneline | wc -l)" = 1
