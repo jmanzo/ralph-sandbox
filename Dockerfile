@@ -12,8 +12,9 @@ ARG NODE_MAJOR=22
 #   docker build --build-arg EXTRA_APT_PACKAGES="golang-go postgresql-client"
 ARG EXTRA_APT_PACKAGES=""
 ARG EXTRA_NPM_PACKAGES=""
-# Pin the agent for reproducible images, e.g. CLAUDE_VERSION=2.1.197
+# Pin the agents for reproducible images, e.g. CLAUDE_VERSION=2.1.197
 ARG CLAUDE_VERSION=latest
+ARG CODEX_VERSION=latest
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -36,8 +37,11 @@ RUN if [ -n "$EXTRA_APT_PACKAGES" ]; then \
       && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# The agent itself.
+# Both agents. Codex is here whether or not you use it: it is the fallback the
+# loop reaches for when Anthropic hits a usage limit, and an unattended run at
+# 3am is the wrong time to discover it was never installed.
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
+    && npm install -g "@openai/codex@${CODEX_VERSION}" \
     && if [ -n "$EXTRA_NPM_PACKAGES" ]; then npm install -g ${EXTRA_NPM_PACKAGES}; fi \
     && npm cache clean --force
 
@@ -62,13 +66,16 @@ RUN git config --system --add safe.directory /workspace \
 # Agents refuse to run in yolo mode as root, so the sandbox user is mandatory,
 # not a nicety.
 USER sandboxuser
+# CODEX_HOME sits under $HOME for the same reason CLAUDE_CONFIG_DIR does: $HOME
+# is the Docker volume, so a login survives the container and you sign in once.
 ENV HOME=/home/sandboxuser \
     CLAUDE_CONFIG_DIR=/home/sandboxuser/.claude \
+    CODEX_HOME=/home/sandboxuser/.codex \
     DISABLE_AUTOUPDATER=1 \
     npm_config_prefix=/home/sandboxuser/.npm-global \
     PATH=/home/sandboxuser/.npm-global/bin:/home/sandboxuser/.local/bin:$PATH
 
-RUN mkdir -p /home/sandboxuser/.claude /home/sandboxuser/.npm-global
+RUN mkdir -p /home/sandboxuser/.claude /home/sandboxuser/.codex /home/sandboxuser/.npm-global
 
 COPY --chown=sandboxuser:sandboxuser entrypoint.sh /usr/local/bin/ralph-entrypoint
 # The Ralph loop driver. `ralph loop` runs this instead of handing the agent

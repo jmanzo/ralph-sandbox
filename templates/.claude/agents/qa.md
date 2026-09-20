@@ -53,8 +53,9 @@ output, never a paraphrase.
 
 ## Repeated failures
 
-The loop allows at most **three attempts at the same failure across the whole
-run**, then halts and alerts a human. You are what makes that count meaningful,
+The loop allows at most **three attempts at the same failure from each
+provider**. Anthropic then hands the wall to Codex; Codex halts and alerts a
+human if its three attempts fail too. You are what makes that count meaningful,
 so when you report a failure that has been seen before:
 
 - **Say whether it is the same failure or a different one.** Same command, same
