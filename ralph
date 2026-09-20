@@ -34,6 +34,13 @@ RALPH_HOME_VOLUME="${RALPH_HOME_VOLUME:-ralph-home}"
 RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
 RALPH_AGENT_CMD="${RALPH_AGENT_CMD:-claude --dangerously-skip-permissions}"
 
+# The Ralph loop: how many iterations `ralph loop` runs without an argument,
+# and when it gives up on an agent that is failing or going in circles.
+RALPH_LOOP_MAX="${RALPH_LOOP_MAX:-10}"
+RALPH_LOOP_SLEEP="${RALPH_LOOP_SLEEP:-0}"
+RALPH_LOOP_STALL="${RALPH_LOOP_STALL:-3}"
+RALPH_LOOP_FAILS="${RALPH_LOOP_FAILS:-2}"
+
 # Workspace isolation, mirroring Docker Sandboxes:
 #   direct -- host workspace bind-mounted read-write (live, and destructible)
 #   clone  -- host workspace read-only, agent works in a private copy
@@ -364,6 +371,7 @@ cmd_run() {
   local entry=()
   case "${RALPH_ENTRY:-agent}" in
     shell) entry=(/bin/bash) ;;
+    loop)  entry=(ralph-loop) ;;
     *)     read -r -a entry <<<"$RALPH_AGENT_CMD" ;;
   esac
 
@@ -439,6 +447,10 @@ cmd_run() {
     -e TERM="${TERM:-xterm-256color}" \
     -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
     -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}" \
+    -e RALPH_AGENT_CMD="$RALPH_AGENT_CMD" \
+    -e RALPH_LOOP_SLEEP="$RALPH_LOOP_SLEEP" \
+    -e RALPH_LOOP_STALL="$RALPH_LOOP_STALL" \
+    -e RALPH_LOOP_FAILS="$RALPH_LOOP_FAILS" \
     ${extra[@]+"${extra[@]}"} \
     "$RALPH_IMAGE" "${entry[@]}" "$@"
 }
@@ -546,12 +558,88 @@ cmd_proxy() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# The Ralph loop
+# ---------------------------------------------------------------------------
+# `init` lays down the PRD, the loop prompt, the shared state files and the
+# orchestrator's three subagents. It runs on the host, not in the sandbox, so
+# you can open PRD.md in your editor before anything starts.
+cmd_init() {
+  case "${1:-}" in
+    ''|--force) : ;;
+    *) die "unknown argument: $1 (expected --force)" ;;
+  esac
+  local force=0
+  [ "${1:-}" = "--force" ] && force=1
+
+  local src="$RALPH_ROOT/templates"
+  [ -d "$src" ] || die "templates not found at $src"
+  [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
+
+  local rel dest created=0 skipped=0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    dest="$RALPH_WORKSPACE/$rel"
+    if [ -e "$dest" ] && [ "$force" -eq 0 ]; then
+      printf '  skip    %s\n' "$rel"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    mkdir -p "$(dirname "$dest")"
+    cp "$src/$rel" "$dest"
+    printf '  create  %s\n' "$rel"
+    created=$((created + 1))
+  done <<EOF
+$(cd "$src" && find . -type f | sed 's|^\./||' | sort)
+EOF
+
+  info "$created file(s) created, $skipped left alone"
+  if [ "$skipped" -gt 0 ] && [ "$force" -eq 0 ]; then
+    info "'ralph init --force' would overwrite them"
+  fi
+  cat <<'__NEXT__'
+
+Next:
+  1. Fill in PRD.md -- what you are building, and how a machine can tell when
+     it is done. That file is the loop's entire definition of success.
+  2. ralph loop 5
+
+__NEXT__
+}
+
+# `loop` is `run` with a different entrypoint: the agent is driven by
+# ralph-loop inside the sandbox instead of being handed a terminal. One
+# container and one snapshot for the whole run, not one per iteration.
+cmd_loop() {
+  local n="$RALPH_LOOP_MAX"
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      ''|*[!0-9]*) : ;;
+      *) n="$1"; shift ;;
+    esac
+  fi
+
+  case "$RALPH_MODE" in
+    direct|clone)
+      [ -f "$RALPH_WORKSPACE/.ralph/PROMPT.md" ] ||
+        die "no .ralph/PROMPT.md in $RALPH_WORKSPACE -- run 'ralph init' first"
+      [ -f "$RALPH_WORKSPACE/PRD.md" ] ||
+        warn "no PRD.md -- the loop has no definition of done to work towards"
+      ;;
+  esac
+
+  info "looping up to $n iteration(s), mode=$RALPH_MODE"
+  RALPH_ENTRY=loop cmd_run "$n" "$@"
+}
+
 cmd_help() {
   cat <<'__HELP__'
 ralph -- run a coding agent in yolo mode inside a locked-down container.
 
 COMMANDS
   ralph [run] [args...]   Launch the agent over the current directory (default)
+  ralph init [--force]    Scaffold the Ralph loop: PRD, prompt, state, subagents
+  ralph loop [N]          Run the loop unattended, up to N iterations
   ralph shell [args...]   Open a shell in the sandbox instead
   ralph status            Show mode, network policy, images and volumes
   ralph build [docker..]  Build the sandbox and proxy images
@@ -576,12 +664,20 @@ FIRST RUN
   ralph                   then type /login inside the agent.
   The login persists in a Docker volume, so you only do this once.
 
+THE LOOP
+  ralph init              then edit PRD.md
+  ralph loop 10           one task per iteration until the PRD is done, or 10
+                          iterations pass, or the agent stops making progress
+
 KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_MODE              direct | clone | none        [direct]
   RALPH_NETWORK_POLICY    on | off                     [on]
   RALPH_HARDEN            on | off (drops caps, breaks sudo)  [off]
   RALPH_SNAPSHOT          on | off                     [on]
   RALPH_AGENT_CMD         command run inside           [claude --dangerously-skip-permissions]
+  RALPH_LOOP_MAX          default iteration budget     [10]
+  RALPH_LOOP_STALL        stop after N idle iterations [3]
+  RALPH_LOOP_FAILS        stop after N agent failures  [2]
   RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
   RALPH_MOUNT_GITCONFIG   [1]      RALPH_MOUNT_SSH     [0]
 
@@ -591,6 +687,8 @@ __HELP__
 
 case "${1:-run}" in
   run)      shift || true; cmd_run "$@" ;;
+  init)     shift; cmd_init "$@" ;;
+  loop)     shift; cmd_loop "$@" ;;
   shell)    shift; cmd_shell "$@" ;;
   build)    shift; cmd_build "$@" ;;
   update)   shift; cmd_update "$@" ;;

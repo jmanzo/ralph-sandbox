@@ -10,8 +10,13 @@ your host, one bad command is your dotfiles, your SSH keys, or your other
 repositories -- and an agent with open internet can send anything it reads
 anywhere. `ralph` puts the agent somewhere it can only reach what you gave it.
 
-It is a Dockerfile, a proxy config, and one shell script. No daemon, no service,
+It is a Dockerfile, a proxy config, and two shell scripts. No daemon, no service,
 nothing to trust that you can't read in ten minutes.
+
+On top of that boundary it runs [Ralph](https://www.aihero.dev/getting-started-with-ralph):
+the same prompt, at the same agent, over and over, one task per iteration, until
+a PRD you wrote is satisfied. `ralph loop` is the part you leave running; the
+sandbox is what makes leaving it running reasonable.
 
 ## Relationship to Docker Sandboxes
 
@@ -64,6 +69,89 @@ complete the flow. **You only do this once** -- credentials live in a Docker vol
 that persists across runs, rebuilds, and projects.
 
 Run `ralph status` at any time to see exactly what is in effect.
+
+## The loop
+
+```bash
+cd ~/code/your-project
+ralph init            # scaffold the PRD, the prompt, the state files, the subagents
+$EDITOR PRD.md        # the only file you have to write by hand
+ralph loop 10         # up to 10 iterations, unattended
+```
+
+### What `ralph init` lays down
+
+```
+PRD.md                       what you're building, and how a machine can tell it's done
+CLAUDE.md                    conventions, plus the rules every agent in the loop follows
+.ralph/PROMPT.md             the orchestrator's prompt, run fresh every iteration
+.ralph/plan.md               the architect's ordered task list
+.ralph/progress.md           append-only log -- the loop's memory between iterations
+.claude/agents/architect.md
+.claude/agents/developer.md
+.claude/agents/qa.md
+```
+
+It never overwrites a file you already have. `ralph init --force` does.
+
+### The shape of an iteration
+
+Every iteration is a *fresh* agent session that remembers nothing. The top-level
+session is the orchestrator; it delegates to three subagents, each with its own
+context window:
+
+```
+                    orchestrator              plans, picks ONE task,
+                         |                    commits, writes the log
+           +-------------+-------------+
+           v             v             v
+       architect     developer         qa      separate sessions,
+       designs and   writes the        runs the verification,
+       orders the    code and the      reports failures
+       plan          tests             precisely
+```
+
+The division of labour is enforced by tooling, not just by prompt. The architect
+may write only `.ralph/plan.md`, so design pressure can't be resolved by quietly
+patching something. QA has no edit tools at all, so it can't fix what it was
+supposed to report -- finding and fixing in one pass is how a loop convinces
+itself it succeeded. And Claude Code subagents can't spawn subagents, so the tree
+is exactly this deep: no runaway fan-out while you're asleep.
+
+Between iterations the only things that survive are the git history and
+`.ralph/progress.md`. That's the whole discipline: context an agent didn't write
+down is context the next iteration doesn't have.
+
+### When the loop stops
+
+| Exit | Why |
+| --- | --- |
+| `0` | The agent emitted `<promise>COMPLETE</promise>` -- the PRD is done |
+| `1` | The agent process itself failed twice running (`RALPH_LOOP_FAILS`) |
+| `2` | Three iterations running changed nothing (`RALPH_LOOP_STALL`) |
+| `3` | The iteration budget ran out |
+
+The stall detector is the one that saves money. Each round it fingerprints
+`HEAD`, the working-tree diff and `progress.md`; a loop that is narrating rather
+than working gets stopped instead of billing you for another seven turns of it.
+The completion sigil is only honoured in the agent's *final* message, so an
+iteration that merely quotes its own instructions doesn't end the run.
+
+Full JSONL transcripts land in `.ralph/logs/`, one per iteration, with the cost
+of each. The whole run is one container and **one** snapshot, not one per
+iteration.
+
+### Reviewing before anything lands
+
+```bash
+RALPH_MODE=clone ralph loop 10   # the loop works on a private copy
+ralph diff                       # read everything it did
+ralph apply                      # land it, snapshotting first
+```
+
+Run `ralph init` before the first clone-mode launch. The private copy is seeded
+from your workspace once and then left alone, so files added afterwards don't
+appear in it -- `ralph clean workspace` reseeds if you get the order wrong.
 
 ## Workspace modes
 
@@ -159,6 +247,8 @@ RALPH_MEMORY=8g RALPH_CPUS=4 ralph
 
 ```
 ralph [run] [args...]   Launch the agent over the current directory (default)
+ralph init [--force]    Scaffold the loop: PRD, prompt, state, subagents
+ralph loop [N]          Run the loop unattended, up to N iterations
 ralph shell             Open a shell in the sandbox
 ralph status            Mode, network policy, images, volumes
 ralph build / update    Build images / rebuild with the latest agent
@@ -184,6 +274,10 @@ Environment variables, or `~/.config/ralph/config.env`:
 | `RALPH_MEMORY` / `RALPH_CPUS` | -- | Resource limits |
 | `RALPH_PIDS_LIMIT` | `2048` | Process cap |
 | `RALPH_AGENT_CMD` | `claude --dangerously-skip-permissions` | Command run inside |
+| `RALPH_LOOP_MAX` | `10` | Iterations when `ralph loop` is given no number |
+| `RALPH_LOOP_STALL` | `3` | Stop after this many iterations that change nothing |
+| `RALPH_LOOP_FAILS` | `2` | Stop after this many consecutive agent failures |
+| `RALPH_LOOP_SLEEP` | `0` | Seconds to pause between iterations |
 | `RALPH_IMAGE` | `ralph-sandbox` | Image tag |
 | `RALPH_HOME_VOLUME` | `ralph-home` | Volume holding the login |
 | `RALPH_WORKSPACE` | `$PWD` | Directory to sandbox |
@@ -245,6 +339,9 @@ Worth reading before you rely on this.
   it so the agent can push, use a key scoped to that.
 - **The allowlist is only as tight as you make it.** Anything reachable is a
   possible destination for your source code.
+- **An unattended loop is still an unattended loop.** The budget, the stall
+  detector and the sandbox bound what it can cost and reach; they cannot make it
+  right. Read the diff before you ship it.
 
 ## Troubleshooting
 
@@ -273,7 +370,7 @@ warning-free:
 
 ```bash
 docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:stable \
-  ralph install.sh yolo-run.sh entrypoint.sh
+  ralph install.sh yolo-run.sh entrypoint.sh loop.sh
 ```
 
 ## License
