@@ -30,6 +30,9 @@ jobs:
           grep -qE '^architect +sonnet'    /tmp/models
           grep -qE '^developer +opus'      /tmp/models
           grep -qE '^qa +sonnet'           /tmp/models
+          # codex gets one row, not four: one session plays all four roles
+          grep -qE '^codex +gpt-5\.6-sol'   /tmp/models
+          test -f .ralph/PROMPT.codex.md && test -f AGENTS.md
 
       - name: Escalating and degrading a role is one command
         run: |
@@ -40,6 +43,11 @@ jobs:
           "$GITHUB_WORKSPACE/ralph" model | grep -qE '^developer +opus'
           # the orchestrator is an env var, not a file, and says so
           ! "$GITHUB_WORKSPACE/ralph" model orchestrator haiku 2>/dev/null
+          # so is codex's, for the same reason
+          ! "$GITHUB_WORKSPACE/ralph" model codex gpt-5.6-terra 2>/dev/null
+          # and an OpenAI model must never be written into a file Claude reads
+          ! "$GITHUB_WORKSPACE/ralph" model developer gpt-5.6-sol 2>/dev/null
+          "$GITHUB_WORKSPACE/ralph" model | grep -qE '^developer +opus'
 
       - name: The same failure three times halts the run and writes an alert
         run: |
@@ -54,7 +62,7 @@ jobs:
           AGENT
           chmod +x agent
           rc=0
-          RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp \
+          RALPH_FALLBACK=off RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp \
             bash "$GITHUB_WORKSPACE/loop.sh" 10 || rc=$?
           echo "exit=$rc"
           test "$rc" = 4
@@ -111,6 +119,152 @@ jobs:
           test "$rc" = 5
           grep -q "spend ceiling" .ralph/alert.txt
 
+      - name: Fake providers for the handover tests
+        run: |
+          cd /tmp/lp
+          # A claude that always reports the usage limit and dies.
+          cat > limited <<'AGENT'
+          #!/usr/bin/env bash
+          printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"total_cost_usd":0.02,"result":"Claude AI usage limit reached|1790000000"}'
+          exit 1
+          AGENT
+          # A claude that is simply broken, with no limit anywhere in sight.
+          cat > broken <<'AGENT'
+          #!/usr/bin/env bash
+          echo "boom" >&2
+          exit 7
+          AGENT
+          # A claude that keeps hitting the same wall.
+          cat > walled <<'AGENT'
+          #!/usr/bin/env bash
+          n=$(( $(cat .n 2>/dev/null || echo 0) + 1 )); echo "$n" > .n
+          echo "claude $n" >> .ralph/progress.md
+          git add -A >/dev/null 2>&1; git commit -qm "c $n" >/dev/null 2>&1
+          printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0.10,"result":"<blocked>npm test: expected 401, received 500</blocked>"}'
+          AGENT
+          # A codex that finishes the PRD on its third turn, in codex's own
+          # event shape, writing its final message where -o points.
+          cat > fixer <<'AGENT'
+          #!/usr/bin/env bash
+          out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; *) shift;; esac; done
+          cat >/dev/null
+          n=$(( $(cat .c 2>/dev/null || echo 0) + 1 )); echo "$n" > .c
+          echo "codex $n" >> .ralph/progress.md
+          git add -A >/dev/null 2>&1; git commit -qm "x $n" >/dev/null 2>&1
+          msg="did task $n"
+          if [ "$n" -ge 3 ]; then msg="$msg
+          <promise>COMPLETE</promise>"; fi
+          # Real codex interleaves tracing lines with the JSONL, and the loop
+          # captures both streams. A parser that aborts on the first non-event
+          # accounts for nothing, which is exactly what it used to do.
+          echo "2026-01-01T00:00:00Z ERROR codex_core: some transport warning" >&2
+          printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1200,"output_tokens":300}}'
+          [ -n "$out" ] && printf '%s' "$msg" > "$out"
+          exit 0
+          AGENT
+          # A codex that hits the same wall the claude side did.
+          cat > alsowalled <<'AGENT'
+          #!/usr/bin/env bash
+          out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; *) shift;; esac; done
+          cat >/dev/null
+          n=$(( $(cat .c 2>/dev/null || echo 0) + 1 )); echo "$n" > .c
+          echo "codex $n" >> .ralph/progress.md
+          git add -A >/dev/null 2>&1; git commit -qm "x $n" >/dev/null 2>&1
+          printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+          [ -n "$out" ] && printf '%s' '<blocked>npm test: expected 401, received 500</blocked>' > "$out"
+          AGENT
+          chmod +x limited broken walled fixer alsowalled
+
+      - name: A spent usage limit hands the loop to codex on the first failure
+        run: |
+          cd /tmp/lp && rm -f .n .c
+          RALPH_AGENT_CMD=$PWD/limited RALPH_CODEX_CMD=$PWD/fixer RALPH_PROJECT=/tmp/lp \
+            bash "$GITHUB_WORKSPACE/loop.sh" 10
+          cat .ralph/alert.txt
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          assert d['exit'] == 0, d
+          assert d['provider'] == 'codex' and d['started_on'] == 'anthropic', d
+          assert 'usage limit' in d['handover'], d
+          # it did not wait for RALPH_LOOP_FAILS: one limited iteration, then three codex
+          assert d['iterations'] == 4, d
+          # tracing noise in the transcript must not zero the token accounting
+          assert d['tokens_in'] == 3600 and d['tokens_out'] == 900, d
+          print('handover on limit ok:', d['handover'])"
+
+      - name: Repeated agent failure hands over rather than halting
+        run: |
+          cd /tmp/lp && rm -f .n .c
+          RALPH_AGENT_CMD=$PWD/broken RALPH_CODEX_CMD=$PWD/fixer RALPH_PROJECT=/tmp/lp \
+            bash "$GITHUB_WORKSPACE/loop.sh" 10
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          assert d['exit'] == 0 and d['provider'] == 'codex', d
+          assert 'failed 2 times' in d['handover'], d
+          print('handover on failure ok:', d['handover'])"
+
+      - name: Three strikes hand the bug to codex, which gets three of its own
+        run: |
+          cd /tmp/lp && rm -f .n .c
+          rc=0
+          RALPH_AGENT_CMD=$PWD/walled RALPH_CODEX_CMD=$PWD/alsowalled RALPH_PROJECT=/tmp/lp \
+            bash "$GITHUB_WORKSPACE/loop.sh" 20 || rc=$?
+          cat .ralph/alert.txt
+          test "$rc" = 4
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          # three on claude, then three on codex, then halt. The second three
+          # exist because the handover is one-way -- nothing hands it back.
+          assert d['iterations'] == 6, d
+          assert d['provider'] == 'codex' and 'three attempts spent' in d['handover'], d
+          print('strikes ok:', d['iterations'], 'iterations')"
+
+      - name: RALPH_FALLBACK=off keeps a run single-provider
+        run: |
+          cd /tmp/lp && rm -f .n .c
+          rc=0
+          RALPH_FALLBACK=off RALPH_AGENT_CMD=$PWD/broken RALPH_CODEX_CMD=$PWD/fixer \
+            RALPH_PROJECT=/tmp/lp bash "$GITHUB_WORKSPACE/loop.sh" 10 || rc=$?
+          test "$rc" = 1
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          assert d['provider'] == 'anthropic' and d['handover'] == '', d
+          print('no handover, as asked')"
+
+      - name: Codex can start the run outright, and nothing catches it
+        run: |
+          cd /tmp/lp && rm -f .n .c
+          RALPH_PROVIDER=codex RALPH_CODEX_CMD=$PWD/fixer RALPH_PROJECT=/tmp/lp \
+            bash "$GITHUB_WORKSPACE/loop.sh" 5
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          assert d['exit'] == 0 and d['started_on'] == 'codex' and d['handover'] == '', d
+          print('codex-first ok')"
+
+      - name: An agent merely writing about limits does not trigger a handover
+        run: |
+          cd /tmp/lp && rm -f .n .c
+          cat > chatty <<'AGENT'
+          #!/usr/bin/env bash
+          n=$(( $(cat .n 2>/dev/null || echo 0) + 1 )); echo "$n" > .n
+          echo "entry $n" >> .ralph/progress.md
+          git add -A >/dev/null 2>&1; git commit -qm "iter $n" >/dev/null 2>&1
+          printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0.10,"result":"I documented what happens when the usage limit reached state occurs.\n<promise>COMPLETE</promise>"}'
+          AGENT
+          chmod +x chatty
+          RALPH_AGENT_CMD=$PWD/chatty RALPH_CODEX_CMD=$PWD/fixer RALPH_PROJECT=/tmp/lp \
+            bash "$GITHUB_WORKSPACE/loop.sh" 5
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          assert d['provider'] == 'anthropic' and d['handover'] == '', d
+          print('no false handover')"
+
       - name: The completion sigil ends the run
         run: |
           cd /tmp/lp && rm -f .n
@@ -149,7 +303,11 @@ jobs:
             test "$(id -u)" != 0
             test "$(whoami)" = sandboxuser
             node --version && claude --version && git --version
+            codex --version
             rg --version >/dev/null && rsync --version >/dev/null
+            # codex refuses to start if CODEX_HOME is missing, and the home
+            # volume mounts over whatever the image put there
+            test -d "$CODEX_HOME"
           '
 
       - name: Yolo mode must refuse to run as root
@@ -166,6 +324,22 @@ jobs:
           grep -q "allowed" /tmp/a
           ./ralph policy test pastebin.com | tee /tmp/b
           grep -q "BLOCKED" /tmp/b
+          # the codex fallback needs these, or it cannot take over
+          ./ralph policy test auth.openai.com | tee /tmp/c
+          grep -q "allowed" /tmp/c
+          ./ralph policy test chatgpt.com | tee /tmp/d
+          grep -q "allowed" /tmp/d
+
+      - name: policy sync adds shipped rules without losing local ones
+        run: |
+          cfg="${XDG_CONFIG_HOME:-$HOME/.config}/ralph/allowlist"
+          printf '^example\\.invalid$\n' >> "$cfg"
+          grep -v 'openai' "$cfg" > /tmp/trimmed && mv /tmp/trimmed "$cfg"
+          ! grep -q openai "$cfg"
+          ./ralph policy sync
+          grep -q 'auth' "$cfg"
+          grep -q 'example' "$cfg"
+          ./ralph policy sync | grep -q "already has every shipped rule"
 
       - name: Egress is blocked at the route level, not just DNS
         run: |

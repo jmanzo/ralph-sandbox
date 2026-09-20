@@ -31,6 +31,18 @@
 #^http-intake\.logs\.us5\.datadoghq\.com$
 #^browser-intake-us5-datadoghq\.com$
 
+# --- Codex API and authentication (required for the OpenAI fallback) ---
+# auth.openai.com handles the device-code login and every token refresh after
+# it. chatgpt.com/backend-api/codex is where a ChatGPT-plan login sends turns;
+# api.openai.com is where an OPENAI_API_KEY login sends them. Both are listed
+# because `ralph login codex` supports either.
+^auth\.openai\.com$
+^chatgpt\.com$
+^api\.openai\.com$
+
+# Codex telemetry. Blocked by design, like its Anthropic counterpart.
+#^ab\.chatgpt\.com$
+
 # --- Package registries ---
 ^registry\.npmjs\.org$
 ^pypi\.org$

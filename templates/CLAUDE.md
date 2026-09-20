@@ -25,9 +25,10 @@ below apply to every agent in it, orchestrator and subagents alike.
 - **Ideas the PRD did not ask for go in `PROPOSALS.md`.** Not into the code,
   not into the plan. A human promotes them into `PRD.md` later, or doesn't.
 - **Three attempts at the same failure, for the whole run.** Not three per
-  iteration. When they are spent, the run stops and a human is alerted. Two
-  agents trading the same error back and forth is the most expensive thing this
-  loop can do, and the least likely to work.
+  iteration, and not three fresh ones because the provider changed. When they
+  are spent, the run stops and a human is alerted. Two agents trading the same
+  error back and forth is the most expensive thing this loop can do, and the
+  least likely to work.
 
 ## Who runs on what
 
@@ -39,6 +40,11 @@ below apply to every agent in it, orchestrator and subagents alike.
 | QA | `sonnet` | Running things and reporting precisely |
 
 Change one with `ralph model <role> <model>`; `ralph model` alone lists them.
+
+If the loop hands over to Codex -- on a usage limit, on repeated failure, or
+when three attempts on one failure are spent -- all four roles collapse into one
+session on `RALPH_CODEX_MODEL` (default `gpt-5.6-sol`), because Codex has no
+per-role subagent definitions. See `AGENTS.md` for what that changes.
 
 **Starting cheap.** For an MVP, run the developer on `sonnet` as well
 (`ralph model developer sonnet`) and leave it there while the work is

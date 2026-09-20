@@ -50,6 +50,8 @@ so even a total wipe of your working tree is recoverable (see below).
 - Docker (Desktop, Colima, OrbStack, or plain Engine)
 - `bash` (the macOS system bash 3.2 is fine)
 - A Claude subscription or an `ANTHROPIC_API_KEY`
+- Optional, for the OpenAI fallback: a ChatGPT plan that includes Codex, or an
+  `OPENAI_API_KEY`
 
 Builds natively on **arm64 and amd64**, Apple Silicon included, no emulation.
 
@@ -61,12 +63,25 @@ cd ralph-sandbox
 ./install.sh            # symlinks `ralph` into ~/.local/bin
 
 cd ~/code/your-project
-ralph                   # builds images on first use, then launches the agent
+ralph login anthropic   # builds images on first use, then: type /login
+ralph                   # launch the agent
 ```
 
-The first launch drops you into the agent unauthenticated. Type `/login` and
-complete the flow. **You only do this once** -- credentials live in a Docker volume
-that persists across runs, rebuilds, and projects.
+`ralph login anthropic` drops you into the agent unauthenticated; type `/login`
+and complete the flow. **You only do this once** -- credentials live in a Docker
+volume that persists across runs, rebuilds, and projects.
+
+If you want the OpenAI fallback to be able to take over, sign that in too:
+
+```bash
+ralph login codex       # device code; open the URL it prints, anywhere
+ralph login status      # what the sandbox is currently signed in to
+```
+
+The device-code flow is deliberate. The ordinary OAuth flow wants to bind a
+localhost callback *inside* the container, which no browser on your machine can
+reach. With `OPENAI_API_KEY` set on the host, `ralph login codex` uses that
+instead and asks you nothing.
 
 Run `ralph status` at any time to see exactly what is in effect.
 
@@ -89,7 +104,9 @@ still caps it, for when you want to sample the behaviour rather than finish.
 PRD.md                       what you're building, and how a machine can tell it's done
 PROPOSALS.md                 ideas the loop found but didn't build -- yours to promote
 CLAUDE.md                    conventions, plus the rules every agent in the loop follows
+AGENTS.md                    points Codex at CLAUDE.md, and says what differs when it drives
 .ralph/PROMPT.md             the orchestrator's prompt, run fresh every iteration
+.ralph/PROMPT.codex.md       the same iteration, for one agent playing all four roles
 .ralph/plan.md               the architect's ordered task list
 .ralph/progress.md           append-only log -- the loop's memory between iterations
 .claude/agents/architect.md
@@ -126,6 +143,10 @@ is exactly this deep: no runaway fan-out while you're asleep.
 Between iterations the only things that survive are the git history and
 `.ralph/progress.md`. That's the whole discipline: context an agent didn't write
 down is context the next iteration doesn't have.
+
+That shape is Anthropic's. When codex takes the loop it collapses into one
+session walking the same four roles in sequence -- see
+[When OpenAI takes over](#when-openai-takes-over).
 
 ### What it noticed but didn't build
 
@@ -183,6 +204,78 @@ role that decides the PRD is done and emits the completion sigil. On `haiku`
 that is the cheapest seat in the tree and also the one whose misjudgement is
 least recoverable. If a run ends suspiciously early, raise that one first.
 
+### When OpenAI takes over
+
+Anthropic drives the loop by default. Codex catches it when Anthropic runs out
+of road, and the handover is **one-way** -- nothing hands it back.
+
+| Trigger | What happens |
+| --- | --- |
+| Anthropic reports a usage limit | Hand over on the **first** failed iteration, not after `RALPH_LOOP_FAILS` |
+| The agent process fails `RALPH_LOOP_FAILS` times running | Hand over instead of exiting `1` |
+| The same failure survives `RALPH_LOOP_REPEAT` iterations | Hand the bug to codex for a fresh theory instead of exiting `4` |
+| `ralph loop --provider codex` | Start there; nothing catches it |
+
+The incoming provider gets **its own three attempts, and no more**. Once codex
+holds the loop, a limit, repeated failure or three strikes stops the run for
+real. Without that the budget would be meaningless, because each side would
+keep granting the other a fresh three.
+
+The limit check only fires on an iteration that *also* failed. An agent merely
+writing the words "usage limit reached" into its transcript does not hand your
+run to another provider.
+
+```bash
+ralph loop                        # anthropic, falling back to codex
+ralph loop --provider codex       # codex from the start
+RALPH_FALLBACK=off ralph loop     # no handover; a wall halts the run
+```
+
+**Codex runs one session, not four.** Codex has no per-role subagent
+definitions -- the subagents it spawns all share a single
+`default_subagent_model` -- so there is no per-role dial to set. Instead
+`.ralph/PROMPT.codex.md` walks one agent through all four roles in sequence,
+and `ralph model` shows codex as a single row:
+
+```
+orchestrator   haiku       (RALPH_MODEL_ORCHESTRATOR)
+architect      sonnet      .claude/agents/architect.md
+developer      opus        .claude/agents/developer.md
+qa             sonnet      .claude/agents/qa.md
+codex          gpt-5.6-sol (RALPH_CODEX_MODEL, high effort -- all four roles)
+```
+
+One model has to cover the architect's and the developer's work, so the default
+is the seat those demand rather than the cheap routing seat:
+
+| `RALPH_CODEX_MODEL` | When |
+| --- | --- |
+| `gpt-6-astra` | The developer work is genuinely hard and you want the ceiling |
+| `gpt-5.6-sol` | **Default.** The seat the architect and developer work demands |
+| `gpt-5.6-terra` | A cheaper fallback, for CRUD-shaped work |
+| `gpt-5.6-luna` | Cheapest; expect to babysit it |
+
+`RALPH_CODEX_EFFORT` is the second dial (`low`, `medium`, `high`, `xhigh`,
+`max`) and matters as much as the model. It defaults to `high`; escalate to
+`xhigh` before reaching for a bigger model.
+
+Because one agent both writes the code and verifies it, the codex prompt leans
+hard on the QA step -- run the PRD's commands, read the diff as if someone else
+wrote it. It is the weakest point of the single-session shape, and it is where
+`.ralph/PROMPT.codex.md` spends its words.
+
+**Two things do not carry over.** Codex on a ChatGPT login reports tokens, not
+dollars, so `RALPH_LOOP_MAX_COST` can only police the Anthropic half of a run
+-- the loop says so when it hands over. And the shipped egress policy gained
+OpenAI hosts, which an allowlist seeded before this feature will not have:
+
+```bash
+ralph policy sync      # adds what is missing, keeps your own rules
+```
+
+`ralph loop` warns when the fallback is enabled and the policy cannot reach
+OpenAI, rather than letting you find out during a 3am handover.
+
 ### Three strikes on the same failure
 
 Two agents trading one bug back and forth is the most expensive way for an
@@ -235,6 +328,9 @@ without opening one.
 | `4` | The same failure came back three iterations running (`RALPH_LOOP_REPEAT`) |
 | `5` | Spending passed `RALPH_LOOP_MAX_COST` |
 
+`1` and `4` hand the loop to codex first, if a fallback is available and has not
+already been used. They stop the run only once no provider is left.
+
 Uncapped does not mean unbounded: `2`, `4` and `5` are what actually stop a run
 that is not going to finish. If you want a hard ceiling in dollars rather than
 iterations, that is `RALPH_LOOP_MAX_COST=25`.
@@ -246,7 +342,9 @@ The completion sigil is only honoured in the agent's *final* message, so an
 iteration that merely quotes its own instructions doesn't end the run.
 
 Full JSONL transcripts land in `.ralph/logs/`, one per iteration, with the cost
-of each. The whole run is one container and **one** snapshot, not one per
+of each, plus a `.last.txt` holding the final message the guardrails actually
+read. `.ralph/alert.json` records which provider finished the run, which one
+started it, and what caused any handover. The whole run is one container and **one** snapshot, not one per
 iteration.
 
 ### Reviewing before anything lands
@@ -292,14 +390,20 @@ any destination not on the allowlist.
 ralph policy ls                      # show the active allowlist
 ralph policy edit                    # edit it, proxy restarts automatically
 ralph policy test github.com         # check one host against the policy
+ralph policy sync                    # add shipped rules yours is missing
 ralph policy reset                   # back to shipped defaults
 ```
+
+Your allowlist is seeded once and then belongs to you, so shipping a new default
+does not reach an existing install. That is usually what you want, and exactly
+wrong for a host a new feature needs -- which is what `ralph policy sync` is
+for: it appends what is missing and touches nothing already there.
 
 Because the block is at the *route* level rather than DNS, connecting to a raw IP
 to bypass name resolution fails too, and UDP and ICMP have nowhere to go at all.
 
-The shipped allowlist covers the agent API, npm, PyPI, GitHub, and Ubuntu package
-mirrors. **Trim it to what your work actually needs** -- every entry is a place data
+The shipped allowlist covers both agents' APIs and logins, npm, PyPI, GitHub,
+and Ubuntu package mirrors. **Trim it to what your work actually needs** -- every entry is a place data
 could go. Entries are extended regexes matched against the hostname; anchor them
 with `^...$` so a rule for `github.com` can't be satisfied by
 `github.com.attacker.example`.
@@ -355,13 +459,14 @@ RALPH_MEMORY=8g RALPH_CPUS=4 ralph
 
 ```
 ralph [run] [args...]   Launch the agent over the current directory (default)
-ralph init [--force]    Scaffold the loop: PRD, prompt, state, subagents
+ralph login [provider]  Sign the sandbox in to anthropic or codex, or `status`
+ralph init [--force]    Scaffold the loop: PRD, prompts, state, subagents
 ralph loop [N]          Run until the PRD is done (N caps the iterations)
 ralph model [role model]  Show, or change, the model behind each role
 ralph shell             Open a shell in the sandbox
-ralph status            Mode, network policy, images, volumes
-ralph build / update    Build images / rebuild with the latest agent
-ralph policy   <ls|edit|test HOST|reset>
+ralph status            Provider, logins, mode, network policy, images, volumes
+ralph build / update    Build images / rebuild with the latest agents
+ralph policy   <ls|edit|sync|test HOST|reset>
 ralph snapshot <ls|create|restore [ID]>
 ralph diff / apply      Clone mode: review and land changes
 ralph proxy    <up|down|logs|status>
@@ -390,12 +495,17 @@ Environment variables, or `~/.config/ralph/config.env`:
 | `RALPH_LOOP_SLEEP` | `0` | Seconds to pause between iterations |
 | `RALPH_LOOP_REPEAT` | `3` | Halt after this many repeats of one failure |
 | `RALPH_MODEL_ORCHESTRATOR` | `haiku` | Model behind the orchestrator |
+| `RALPH_PROVIDER` | `anthropic` | Who drives the loop: `anthropic` or `codex` |
+| `RALPH_FALLBACK` | `codex` | Who catches it, or `off` for single-provider runs |
+| `RALPH_CODEX_MODEL` | `gpt-5.6-sol` | One model for all four roles on the codex side |
+| `RALPH_CODEX_EFFORT` | `high` | `low`, `medium`, `high`, `xhigh`, `max` |
+| `RALPH_LIMIT_PATTERN` | see `loop.sh` | What a spent usage limit looks like in a transcript |
 | `RALPH_SLACK_WEBHOOK` | -- | Slack incoming webhook |
 | `RALPH_DISCORD_WEBHOOK` | -- | Discord webhook |
 | `RALPH_TELEGRAM_TOKEN` / `_CHAT` | -- | Telegram bot token and chat id |
 | `RALPH_NOTIFY_ON` | `always` | `always`, or `problem` for bad endings only |
 | `RALPH_IMAGE` | `ralph-sandbox` | Image tag |
-| `RALPH_HOME_VOLUME` | `ralph-home` | Volume holding the login |
+| `RALPH_HOME_VOLUME` | `ralph-home` | Volume holding both providers' logins |
 | `RALPH_WORKSPACE` | `$PWD` | Directory to sandbox |
 | `RALPH_MOUNT_GITCONFIG` | `1` | Mount `~/.gitconfig` read-only |
 | `RALPH_MOUNT_SSH` | `0` | Mount `~/.ssh` read-only (see below) |
@@ -408,6 +518,11 @@ Environment variables, or `~/.config/ralph/config.env`:
 ```sh
 RALPH_AGENT_CMD="my-agent --auto"
 ```
+
+Setting it explicitly wins over `--provider`: choosing a provider must not
+silently discard a command you asked for by name. `RALPH_CODEX_CMD` (default
+`codex exec`) is the same knob for the codex side of the loop, and is what the
+test suite substitutes to exercise the handover without spending anything.
 
 ### Per-project isolation
 
@@ -462,6 +577,19 @@ Worth reading before you rely on this.
   rephrases the same failure each time defeats the check, which is why the
   prompt is emphatic about copying it verbatim. The iteration budget is the
   backstop that does not depend on the model behaving.
+- **Codex marks its own homework.** The four-role split on the Anthropic side
+  gives QA no edit tools, so it cannot fix what it finds. The codex side is one
+  session playing every part, because Codex has no per-role subagent
+  definitions to hang the split on. The prompt leans on it; nothing enforces it.
+  If unattended correctness matters more than finishing, set
+  `RALPH_FALLBACK=off` and let a wall halt the run.
+- **The usage-limit check is a string match.** It fires only on an iteration
+  that also failed, and its patterns are Claude Code's current wording. If that
+  wording changes, a limit degrades into the ordinary repeated-failure path --
+  slower to hand over, but not wrong. `RALPH_LIMIT_PATTERN` overrides it.
+- **Two providers means two bills.** A spend ceiling only counts Anthropic
+  spend, because codex on a ChatGPT login reports tokens and no price. An
+  uncapped run that hands over is bounded by the guardrails, not by dollars.
 
 ## Troubleshooting
 
@@ -475,6 +603,15 @@ tinyproxy error. Note `FilterType` must be `ere`; `fqdn` is not supported by the
 tinyproxy 1.11.x that Alpine ships.
 
 **Login doesn't stick** -- the home volume was removed or renamed. `ralph status`.
+
+**`CODEX_HOME points to ... but that path does not exist`** -- a home volume
+created before codex support was added. The entrypoint now creates it on every
+start, so `ralph update` fixes it; you do not need to lose your logins.
+
+**The codex fallback never takes over** -- `ralph login status` (is it signed
+in?), then `ralph policy sync` (can it reach `auth.openai.com`?). `ralph loop`
+warns about the second before a run starts, and `.ralph/alert.json` records
+whether a handover was attempted.
 
 **Files written by the agent are root-owned (Linux hosts)** --
 `ralph build --build-arg SANDBOX_UID=$(id -u) --build-arg SANDBOX_GID=$(id -g)`.

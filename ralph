@@ -32,7 +32,26 @@ RALPH_IMAGE="${RALPH_IMAGE:-ralph-sandbox}"
 RALPH_PROXY_IMAGE="${RALPH_PROXY_IMAGE:-ralph-proxy}"
 RALPH_HOME_VOLUME="${RALPH_HOME_VOLUME:-ralph-home}"
 RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
+RALPH_AGENT_CMD_SET="${RALPH_AGENT_CMD+1}"
 RALPH_AGENT_CMD="${RALPH_AGENT_CMD:-claude --dangerously-skip-permissions}"
+
+# Which provider drives the loop, and which one catches it when the first runs
+# out of road. Anthropic is the default and runs the four-role tree; OpenAI's
+# codex is the fallback and runs one session playing all four parts, because
+# Codex has no per-role subagent definitions. RALPH_FALLBACK=off keeps a run
+# single-provider.
+RALPH_PROVIDER="${RALPH_PROVIDER:-anthropic}"
+RALPH_FALLBACK="${RALPH_FALLBACK:-codex}"
+RALPH_CODEX_CMD="${RALPH_CODEX_CMD:-codex exec}"
+RALPH_CODEX_AGENT_CMD="${RALPH_CODEX_AGENT_CMD:-codex --dangerously-bypass-approvals-and-sandbox}"
+# One model for the whole codex session, so this is the seat the architect and
+# developer work demands, not the cheap routing seat. gpt-5.6-terra and
+# gpt-5.6-luna are the cheaper rungs; gpt-6-astra is the expensive one.
+RALPH_CODEX_MODEL="${RALPH_CODEX_MODEL:-gpt-5.6-sol}"
+RALPH_CODEX_EFFORT="${RALPH_CODEX_EFFORT:-high}"
+# What a spent usage limit looks like in a transcript. Only consulted on an
+# iteration that already failed.
+RALPH_LIMIT_PATTERN="${RALPH_LIMIT_PATTERN:-}"
 
 # The Ralph loop: how many iterations `ralph loop` runs without an argument,
 # and when it gives up on an agent that is failing or going in circles.
@@ -107,6 +126,50 @@ image_exists()  { docker image inspect  "$1" >/dev/null 2>&1; }
 volume_exists() { docker volume inspect "$1" >/dev/null 2>&1; }
 net_exists()    { docker network inspect "$1" >/dev/null 2>&1; }
 proxy_running() { [ "$(docker inspect -f '{{.State.Running}}' "$RALPH_PROXY_NAME" 2>/dev/null)" = "true" ]; }
+
+# The command `ralph run` hands the terminal to, which depends on who is
+# driving. An explicit RALPH_AGENT_CMD still wins, as it always has: choosing
+# a provider must not silently discard a command someone asked for by name.
+provider_agent_cmd() {
+  case "$1" in
+    codex) [ -n "$RALPH_AGENT_CMD_SET" ] \
+             && printf '%s' "$RALPH_AGENT_CMD" \
+             || printf '%s' "$RALPH_CODEX_AGENT_CMD" ;;
+    *)     printf '%s' "$RALPH_AGENT_CMD" ;;
+  esac
+}
+
+check_provider() {
+  case "$1" in
+    anthropic|claude) printf 'anthropic' ;;
+    codex|openai)     printf 'codex' ;;
+    *) die "unknown provider '$1' (expected anthropic or codex)" ;;
+  esac
+}
+
+# --provider, wherever it appears in a command's arguments. Consumed here so it
+# never reaches the agent.
+take_provider_flag() {
+  RALPH_ARGV=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --provider)   [ $# -ge 2 ] || die "--provider needs a value"
+                    RALPH_PROVIDER="$(check_provider "$2")"; shift 2 ;;
+      --provider=*) RALPH_PROVIDER="$(check_provider "${1#*=}")"; shift ;;
+      *) RALPH_ARGV+=("$1"); shift ;;
+    esac
+  done
+}
+
+# The codex fallback is useless if the egress policy predates it. Check before
+# a run rather than discovering it during the handover, when nobody is watching.
+warn_codex_egress() {
+  [ "$RALPH_NETWORK_POLICY" = "on" ] || return 0
+  [ -f "$RALPH_ALLOWLIST" ] || return 0
+  grep -q 'auth\\.openai\\.com' "$RALPH_ALLOWLIST" && return 0
+  warn "the egress policy has no OpenAI hosts, so codex cannot reach its API"
+  warn "run 'ralph policy sync' to add them without losing your own rules"
+}
 
 # Does the proxy actually answer on the internal network? The proxy image is
 # Alpine, so busybox nc is already there and this costs almost nothing.
@@ -203,6 +266,30 @@ cmd_policy() {
       info "policy reset to defaults"
       proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
       ;;
+    sync)
+      # An allowlist is seeded once and then belongs to the user, so shipping a
+      # new default does not reach an existing install. That is usually right,
+      # and exactly wrong for a host a new feature needs: the codex fallback
+      # would fail at the far end of an unattended run. This adds what is
+      # missing and touches nothing that is already there.
+      ensure_allowlist
+      local added=0 rule
+      while IFS= read -r rule; do
+        [ -n "$rule" ] || continue
+        grep -qxF "$rule" "$RALPH_ALLOWLIST" && continue
+        [ "$added" -eq 0 ] && printf '\n# --- added by ralph policy sync on %s ---\n' \
+          "$(date -u +%Y-%m-%d)" >> "$RALPH_ALLOWLIST"
+        printf '%s\n' "$rule" >> "$RALPH_ALLOWLIST"
+        info "added $rule"
+        added=$((added + 1))
+      done < <(grep -vE '^\s*(#|$)' "$RALPH_ROOT/policy/default.allowlist")
+      if [ "$added" -eq 0 ]; then
+        info "policy already has every shipped rule"
+      else
+        info "$added rule(s) added to $RALPH_ALLOWLIST"
+        proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
+      fi
+      ;;
     test)
       local host="${2:-}"
       [ -n "$host" ] || die "usage: ralph policy test <hostname>"
@@ -214,7 +301,7 @@ cmd_policy() {
             if [ "$code" = "000" ]; then printf '%s: BLOCKED by policy\n' "$host"
             else printf '%s: allowed (HTTP %s)\n' "$host" "$code"; fi; }
       ;;
-    *) die "usage: ralph policy <ls|path|edit|reset|test HOST>" ;;
+    *) die "usage: ralph policy <ls|path|edit|sync|reset|test HOST>" ;;
   esac
 }
 
@@ -380,7 +467,7 @@ cmd_build() {
 }
 
 cmd_update() {
-  info "rebuilding from scratch with the latest agent"
+  info "rebuilding from scratch with the latest agents (claude and codex)"
   local uid_args=() ; while IFS= read -r a; do uid_args+=("$a"); done < <(build_uid_args)
   docker build --pull --no-cache ${uid_args[@]+"${uid_args[@]}"} "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
   cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ROOT/proxy/default.allowlist"
@@ -398,7 +485,8 @@ cmd_run() {
   case "${RALPH_ENTRY:-agent}" in
     shell) entry=(/bin/bash) ;;
     loop)  entry=(ralph-loop) ;;
-    *)     read -r -a entry <<<"$RALPH_AGENT_CMD" ;;
+    login) entry=(bash -lc "${RALPH_LOGIN_CMD:-true}") ;;
+    *)     read -r -a entry <<<"$(provider_agent_cmd "$RALPH_PROVIDER")" ;;
   esac
 
   image_exists "$RALPH_IMAGE" || { info "no image yet, building (one time)"; cmd_build; }
@@ -482,9 +570,16 @@ cmd_run() {
     -e TERM="${TERM:-xterm-256color}"
     -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
     -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}"
+    -e OPENAI_API_KEY="${OPENAI_API_KEY:-}"
     -e RALPH_AGENT_CMD="$RALPH_AGENT_CMD"
     -e RALPH_PROJECT="$RALPH_WORKSPACE"
     -e RALPH_MODEL_ORCHESTRATOR="$RALPH_MODEL_ORCHESTRATOR"
+    -e RALPH_PROVIDER="$RALPH_PROVIDER"
+    -e RALPH_FALLBACK="$RALPH_FALLBACK"
+    -e RALPH_CODEX_CMD="$RALPH_CODEX_CMD"
+    -e RALPH_CODEX_MODEL="$RALPH_CODEX_MODEL"
+    -e RALPH_CODEX_EFFORT="$RALPH_CODEX_EFFORT"
+    -e RALPH_LIMIT_PATTERN="$RALPH_LIMIT_PATTERN"
     -e RALPH_LOOP_SLEEP="$RALPH_LOOP_SLEEP"
     -e RALPH_LOOP_STALL="$RALPH_LOOP_STALL"
     -e RALPH_LOOP_FAILS="$RALPH_LOOP_FAILS"
@@ -506,6 +601,89 @@ cmd_run() {
 }
 
 cmd_shell() { RALPH_ENTRY=shell cmd_run "$@"; }
+
+# ---------------------------------------------------------------------------
+# Login
+# ---------------------------------------------------------------------------
+# Both providers keep their credential under the sandbox's $HOME, which is a
+# Docker volume, so a login survives every container after it and you do this
+# once per provider. Doing it from the host is not enough and never was: the
+# sandbox cannot see the host's ~/.claude or ~/.codex.
+#
+# The login flow goes through the same egress proxy as everything else, so
+# auth.openai.com and platform.claude.com have to be on the allowlist for it to
+# complete. They are, in the shipped policy.
+# Probe the volume for the credential each provider actually writes, rather
+# than asking the CLIs. Their status subcommands come and go between releases;
+# the file on disk is what makes the difference between a run that starts and
+# one that dies on its first call.
+login_status() {
+  local provider="$1" probe
+  # Single-quoted on purpose: these expand inside the container, where the
+  # paths exist, not on the host, where they do not.
+  # shellcheck disable=SC2016
+  case "$provider" in
+    codex) probe='test -s "${CODEX_HOME:-$HOME/.codex}/auth.json"' ;;
+    *)     probe='test -s "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"' ;;
+  esac
+  if docker run --rm -v "$RALPH_HOME_VOLUME:/home/sandboxuser" \
+       --entrypoint bash "$RALPH_IMAGE" -lc "$probe" >/dev/null 2>&1; then
+    printf 'logged in (credential in %s)\n' "$RALPH_HOME_VOLUME"
+  else
+    case "$provider" in
+      codex) [ -n "${OPENAI_API_KEY:-}" ] \
+               && printf 'no stored login; OPENAI_API_KEY is set on the host and will be passed in\n' \
+               || printf 'not logged in  (ralph login codex)\n' ;;
+      *)     [ -n "${ANTHROPIC_API_KEY:-}" ] \
+               && printf 'no stored login; ANTHROPIC_API_KEY is set on the host and will be passed in\n' \
+               || printf 'not logged in  (ralph login anthropic)\n' ;;
+    esac
+  fi
+}
+
+cmd_login() {
+  local provider="${1:-$RALPH_PROVIDER}"
+
+  image_exists "$RALPH_IMAGE" || { info "no image yet, building (one time)"; cmd_build; }
+  volume_exists "$RALPH_HOME_VOLUME" || docker volume create "$RALPH_HOME_VOLUME" >/dev/null
+
+  case "$provider" in
+    status)
+      printf 'home volume   %s\n\n' "$RALPH_HOME_VOLUME"
+      printf 'anthropic:\n'; login_status anthropic | sed 's/^/  /'
+      printf 'codex:\n';     login_status codex     | sed 's/^/  /'
+      return 0
+      ;;
+    both|all)
+      cmd_login anthropic
+      cmd_login codex
+      return 0
+      ;;
+  esac
+  provider="$(check_provider "$provider")"
+
+  case "$provider" in
+    codex)
+      # --device-auth is the flow that works without a browser on the same
+      # machine: codex prints a code, you open the URL wherever you like. The
+      # plain OAuth flow wants to bind a localhost callback inside the
+      # container, which no host browser can reach.
+      if [ -n "${OPENAI_API_KEY:-}" ]; then
+        info "logging codex in with OPENAI_API_KEY from the host environment"
+        RALPH_ENTRY=login \
+        RALPH_LOGIN_CMD='printenv OPENAI_API_KEY | codex login --with-api-key' \
+          cmd_run
+      else
+        info "codex device login -- open the URL it prints and enter the code"
+        RALPH_ENTRY=login RALPH_LOGIN_CMD='codex login --device-auth' cmd_run
+      fi
+      ;;
+    *)
+      info "starting the agent -- type /login, finish the flow, then /exit"
+      RALPH_ENTRY=agent RALPH_PROVIDER=anthropic cmd_run
+      ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
 # Clone-mode sync
@@ -548,11 +726,19 @@ cmd_status() {
     clone)  printf '  (host files read-only; agent works in a private copy)\n' ;;
     none)   printf '  (no host filesystem)\n' ;;
   esac
-  printf 'agent         %s\n' "$RALPH_AGENT_CMD"
+  printf 'agent         %s\n' "$(provider_agent_cmd "$RALPH_PROVIDER")"
+  printf 'provider      %s' "$RALPH_PROVIDER"
+  if [ "$RALPH_FALLBACK" = "off" ] || [ "$RALPH_FALLBACK" = "$RALPH_PROVIDER" ]; then
+    printf '  (no fallback -- a limit or a wall halts the run)\n'
+  else
+    printf '  -> %s on a usage limit, repeated failure, or three strikes\n' "$RALPH_FALLBACK"
+  fi
   printf 'orchestrator  %s\n' "$RALPH_MODEL_ORCHESTRATOR"
+  printf 'codex         %s  %s effort  (one session, all four roles)\n' \
+    "$RALPH_CODEX_MODEL" "$RALPH_CODEX_EFFORT"
   if [ -d "$RALPH_WORKSPACE/.claude/agents" ]; then
     printf 'subagents     %s\n' \
-      "$(cmd_model ls | sed 1d | awk '{printf "%s=%s ", $1, $2}')"
+      "$(cmd_model ls | sed 1d | awk '$1 != "codex" { printf "%s=%s ", $1, $2 }')"
   else
     printf 'subagents     none  (ralph init)\n'
   fi
@@ -583,9 +769,13 @@ cmd_status() {
   else
     printf 'image         %s  (not built, run: ralph build)\n' "$RALPH_IMAGE"
   fi
-  volume_exists "$RALPH_HOME_VOLUME" \
-    && printf 'home volume   %s  (holds the sandbox login)\n' "$RALPH_HOME_VOLUME" \
-    || printf 'home volume   %s  (not created)\n' "$RALPH_HOME_VOLUME"
+  if volume_exists "$RALPH_HOME_VOLUME" && image_exists "$RALPH_IMAGE"; then
+    printf 'home volume   %s  (holds the sandbox logins)\n' "$RALPH_HOME_VOLUME"
+    printf 'login         anthropic: %s\n' "$(login_status anthropic)"
+    printf 'login         codex:     %s\n' "$(login_status codex)"
+  else
+    printf 'home volume   %s  (not created -- ralph login)\n' "$RALPH_HOME_VOLUME"
+  fi
 }
 
 cmd_clean() {
@@ -679,6 +869,9 @@ __NEXT__
 # ralph-loop inside the sandbox instead of being handed a terminal. One
 # container and one snapshot for the whole run, not one per iteration.
 cmd_loop() {
+  take_provider_flag "$@"
+  set -- ${RALPH_ARGV[@]+"${RALPH_ARGV[@]}"}
+
   local n="$RALPH_LOOP_MAX"
   if [ $# -gt 0 ]; then
     case "$1" in
@@ -693,14 +886,29 @@ cmd_loop() {
         die "no .ralph/PROMPT.md in $RALPH_WORKSPACE -- run 'ralph init' first"
       [ -f "$RALPH_WORKSPACE/PRD.md" ] ||
         warn "no PRD.md -- the loop has no definition of done to work towards"
+      # Codex runs a different prompt, because it plays all four roles itself.
+      # A workspace scaffolded before codex support has only the four-role one,
+      # and the handover would fail halfway through an unattended night.
+      if [ "$RALPH_PROVIDER" = "codex" ] || [ "$RALPH_FALLBACK" = "codex" ]; then
+        [ -f "$RALPH_WORKSPACE/.ralph/PROMPT.codex.md" ] || {
+          if [ "$RALPH_PROVIDER" = "codex" ]; then
+            die "no .ralph/PROMPT.codex.md in $RALPH_WORKSPACE -- run 'ralph init' to add it"
+          fi
+          warn "no .ralph/PROMPT.codex.md -- the codex fallback cannot take over; run 'ralph init'"
+        }
+      fi
       ;;
   esac
 
+  if [ "$RALPH_PROVIDER" = "codex" ] || [ "$RALPH_FALLBACK" = "codex" ]; then
+    warn_codex_egress
+  fi
+
   if [ "$n" = "0" ]; then
-    info "looping until the PRD is done, mode=$RALPH_MODE"
+    info "looping until the PRD is done, mode=$RALPH_MODE, provider=$RALPH_PROVIDER"
     info "guardrails: $RALPH_LOOP_REPEAT repeats, $RALPH_LOOP_STALL idle, ${RALPH_LOOP_MAX_COST:-no} spend ceiling"
   else
-    info "looping up to $n iteration(s), mode=$RALPH_MODE"
+    info "looping up to $n iteration(s), mode=$RALPH_MODE, provider=$RALPH_PROVIDER"
   fi
   RALPH_ENTRY=loop cmd_run "$n" "$@"
 }
@@ -804,14 +1012,25 @@ cmd_model() {
         model="$(sed -n 's/^model:[[:space:]]*//p' "$f" | head -1)"
         printf '%-14s %-10s %s\n' "$name" "${model:-inherit}" ".claude/agents/$name.md"
       done
+      # Codex gets one row, not four, because it gets one model: its subagents
+      # all share a single default_subagent_model, so there is no per-role dial
+      # to show. The prompt carries the role split instead.
+      printf '%-14s %-10s %s\n' "codex" "$RALPH_CODEX_MODEL" \
+        "(RALPH_CODEX_MODEL, ${RALPH_CODEX_EFFORT} effort -- all four roles)"
       ;;
     *)
       local role="$1" model="${2:-}" f
       [ -n "$model" ] || die "usage: ralph model <role> <haiku|sonnet|opus|inherit>"
       [ "$role" != "orchestrator" ] ||
         die "the orchestrator's model is RALPH_MODEL_ORCHESTRATOR, not a file (env, or $RALPH_CONFIG)"
+      [ "$role" != "codex" ] ||
+        die "codex's model is RALPH_CODEX_MODEL, not a file (env, or $RALPH_CONFIG)"
       case "$model" in
         haiku|sonnet|opus|inherit|claude-*) ;;
+        # .claude/agents/*.md is read by Claude Code, which cannot run an
+        # OpenAI model. Writing one there fails at the far end of a long
+        # unattended run, which is the worst place to find out.
+        gpt-*|o[0-9]*) die "'$model' is an OpenAI model; set RALPH_CODEX_MODEL instead -- .claude/agents/$role.md is read by Claude Code" ;;
         *) die "unexpected model '$model' (expected haiku, sonnet, opus, inherit, or a claude-* id)" ;;
       esac
       f="$dir/$role.md"
@@ -829,16 +1048,18 @@ ralph -- run a coding agent in yolo mode inside a locked-down container.
 
 COMMANDS
   ralph [run] [args...]   Launch the agent over the current directory (default)
-  ralph init [--force]    Scaffold the Ralph loop: PRD, prompt, state, subagents
+  ralph login [provider]  Sign the sandbox in to anthropic or codex (do this first)
+  ralph init [--force]    Scaffold the Ralph loop: PRD, prompts, state, subagents
   ralph loop [N]          Run until the PRD is done (N caps the iterations)
   ralph model [role model]  Show, or change, the model behind each role
   ralph shell [args...]   Open a shell in the sandbox instead
   ralph status            Show mode, network policy, images and volumes
   ralph build [docker..]  Build the sandbox and proxy images
-  ralph update            Rebuild from scratch with the latest agent
+  ralph update            Rebuild from scratch with the latest agents
 
   ralph policy ls         Show the egress allowlist
   ralph policy edit       Edit it, then restart the proxy
+  ralph policy sync       Add shipped rules yours is missing, keeping your own
   ralph policy test HOST  Check whether a host is reachable under the policy
   ralph policy reset      Restore the shipped defaults
 
@@ -853,8 +1074,22 @@ COMMANDS
   ralph clean <image|volume|workspace|proxy|all>
 
 FIRST RUN
-  ralph                   then type /login inside the agent.
-  The login persists in a Docker volume, so you only do this once.
+  ralph login anthropic   then type /login inside the agent
+  ralph login codex       device-code flow; open the URL it prints
+  ralph login status      what the sandbox is currently signed in to
+
+  Logins persist in a Docker volume, so you only do this once per provider.
+  Sign in to both if you want the codex fallback to be able to take over.
+
+PROVIDERS
+  Anthropic drives the loop by default, as four agents on four models.
+  Codex catches it -- on a usage limit, on repeated failure, or when three
+  attempts on one failure are spent -- and runs ONE session playing all four
+  roles, because Codex has no per-role subagent definitions. The handover is
+  one-way, and the incoming provider gets its own three attempts, not more.
+
+  ralph loop --provider codex    start on codex instead
+  RALPH_FALLBACK=off ralph loop  no handover; a wall halts the run
 
 THE LOOP
   ralph init              then edit PRD.md
@@ -873,6 +1108,7 @@ THE LOOP
   Models per role:
   ralph model developer sonnet   (cheap MVP)
   ralph model developer opus     (escalate when the logic gets intricate)
+  RALPH_CODEX_MODEL=gpt-5.6-terra  (a cheaper seat for the codex fallback)
 
 KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_MODE              direct | clone | none        [direct]
@@ -886,6 +1122,10 @@ KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_LOOP_FAILS        stop after N agent failures  [2]
   RALPH_LOOP_REPEAT       stop after N repeats of one failure  [3]
   RALPH_MODEL_ORCHESTRATOR  model behind the orchestrator  [haiku]
+  RALPH_PROVIDER          anthropic | codex            [anthropic]
+  RALPH_FALLBACK          codex | off                  [codex]
+  RALPH_CODEX_MODEL       one model for all four roles [gpt-5.6-sol]
+  RALPH_CODEX_EFFORT      low|medium|high|xhigh|max    [high]
   RALPH_SLACK_WEBHOOK RALPH_DISCORD_WEBHOOK RALPH_TELEGRAM_TOKEN/_CHAT
   RALPH_NOTIFY_ON         always | problem             [always]
   RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
@@ -896,9 +1136,12 @@ __HELP__
 }
 
 case "${1:-run}" in
-  run)      shift || true; cmd_run "$@" ;;
+  run)      shift || true
+            take_provider_flag "$@"
+            cmd_run ${RALPH_ARGV[@]+"${RALPH_ARGV[@]}"} ;;
   init)     shift; cmd_init "$@" ;;
   loop)     shift; cmd_loop "$@" ;;
+  login)    shift; cmd_login "$@" ;;
   model)    shift; cmd_model "$@" ;;
   shell)    shift; cmd_shell "$@" ;;
   build)    shift; cmd_build "$@" ;;
