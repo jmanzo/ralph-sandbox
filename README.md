@@ -280,18 +280,19 @@ OpenAI, rather than letting you find out during a 3am handover.
 
 Two agents trading one bug back and forth is the most expensive way for an
 unattended loop to achieve nothing. So the same failure gets **three attempts
-across the whole run** -- not three per iteration:
+per provider** -- not three per iteration. A handover gives Codex three tries
+at a different theory; once those are spent, the run stops:
 
 - The **developer** is told how many attempts are left, and that attempt 3 is
-  the last anybody pays for.
+  the last that provider pays for.
 - **QA** reports whether a failure is the same one as last time, and whether the
   last attempt changed the output at all.
 - The **orchestrator**, on giving up, ends its turn with a failure signature:
   `<blocked>npm test -- auth.spec.ts: expected 401, received 500</blocked>`.
 
-The loop compares those signatures literally. Three identical ones running and
-it halts with exit `4` and alerts you, instead of buying another night of the
-same bug. A genuinely different failure resets the count.
+The loop compares those signatures literally. Three identical ones running
+hands Anthropic's wall to Codex, or halts with exit `4` when Codex owns the
+loop. A genuinely different failure resets the count.
 
 ### Notifications
 

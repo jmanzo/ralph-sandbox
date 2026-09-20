@@ -45,14 +45,15 @@ task. You implement it completely and you stop.
 
 ## When you are handed a QA failure
 
-You get at most **three attempts at the same failure across the entire run** --
-not three per iteration. `.ralph/progress.md` records how many have been spent,
-and the orchestrator tells you the count when it hands the failure back.
+You get at most **three attempts at the same failure from this provider** --
+not three per iteration. `.ralph/progress.md` records how many Anthropic
+attempts have been spent, and the orchestrator tells you the count when it
+hands the failure back.
 
 - **Attempt 2**: your first theory was wrong. Do not retry a variation of it.
   Get new evidence first -- read the failing code path, print the actual values,
   reproduce the failure in isolation.
-- **Attempt 3**: this is the last one anybody pays for. If you are not
+- **Attempt 3**: this is the last one this provider pays for. If you are not
   materially more certain than you were on attempt 2, say so and stop. Report
   what you ruled out and what you would need to know. A precise "I am stuck
   because X" is worth more than a fourth guess -- which is why the loop stops

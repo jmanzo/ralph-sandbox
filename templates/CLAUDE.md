@@ -24,11 +24,9 @@ below apply to every agent in it, orchestrator and subagents alike.
   `.ralph/progress.md` will surprise the next iteration too.
 - **Ideas the PRD did not ask for go in `PROPOSALS.md`.** Not into the code,
   not into the plan. A human promotes them into `PRD.md` later, or doesn't.
-- **Three attempts at the same failure, for the whole run.** Not three per
-  iteration, and not three fresh ones because the provider changed. When they
-  are spent, the run stops and a human is alerted. Two agents trading the same
-  error back and forth is the most expensive thing this loop can do, and the
-  least likely to work.
+- **Three attempts at the same failure per provider.** Not three per
+  iteration. A handover gives Codex three attempts at a different theory; if
+  Codex spends them too, the run stops and a human is alerted.
 
 ## Who runs on what
 

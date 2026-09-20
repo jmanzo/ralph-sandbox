@@ -19,9 +19,9 @@ That means nothing enforces the separation for you. In particular:
   commands and read the diff as if someone else wrote it. A PASS you gave
   yourself without running anything is the most expensive kind of wrong,
   because every iteration after it trusts the green.
-- **The three attempts at a failure are for the whole run**, not for each
-  provider. Changing provider does not reset the count -- `.ralph/progress.md`
-  carries it across.
+- **Each provider gets three attempts at a failure**, not three per iteration.
+  A handover gives Codex a fresh budget so it can try a different theory;
+  `.ralph/progress.md` shows which provider made each attempt.
 - **You are the last provider in the loop.** Nothing catches what you drop.
 
 `.ralph/PROMPT.codex.md` is the full iteration protocol. The loop feeds it to

@@ -339,7 +339,7 @@ jobs:
           ./ralph policy sync
           grep -q 'auth' "$cfg"
           grep -q 'example' "$cfg"
-          ./ralph policy sync | grep -q "already has every shipped rule"
+          ./ralph policy sync 2>&1 | grep -q "already has every shipped rule"
 
       - name: Egress is blocked at the route level, not just DNS
         run: |

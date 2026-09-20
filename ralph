@@ -163,11 +163,25 @@ take_provider_flag() {
 
 # The codex fallback is useless if the egress policy predates it. Check before
 # a run rather than discovering it during the handover, when nobody is watching.
+allowlist_allows() {
+  local host="$1" rule
+  while IFS= read -r rule; do
+    printf '%s\n' "$host" | grep -qE -- "$rule" 2>/dev/null && return 0
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$RALPH_ALLOWLIST")
+  return 1
+}
+
 warn_codex_egress() {
+  local turn_host
   [ "$RALPH_NETWORK_POLICY" = "on" ] || return 0
   [ -f "$RALPH_ALLOWLIST" ] || return 0
-  grep -q 'auth\\.openai\\.com' "$RALPH_ALLOWLIST" && return 0
-  warn "the egress policy has no OpenAI hosts, so codex cannot reach its API"
+  if [ -n "${OPENAI_API_KEY:-}" ]; then
+    turn_host=api.openai.com
+  else
+    turn_host=chatgpt.com
+  fi
+  allowlist_allows "$turn_host" && return 0
+  warn "the egress policy does not allow $turn_host, so codex cannot reach its API"
   warn "run 'ralph policy sync' to add them without losing your own rules"
 }
 
@@ -589,13 +603,16 @@ cmd_run() {
     "$RALPH_IMAGE" "${entry[@]}" "$@")
 
   # The loop is wrapped rather than exec'd, so the host survives the container
-  # and can post the alert the sandbox left behind. Everything else hands the
-  # terminal straight over.
+  # and can post the alert the sandbox left behind. Combined login also has to
+  # return so it can start the second provider.
   if [ "${RALPH_ENTRY:-agent}" = "loop" ]; then
     local rc=0
     "${run[@]}" || rc=$?
     loop_notify "$rc"
     exit "$rc"
+  elif [ "${RALPH_RETURN_AFTER_RUN:-0}" = "1" ]; then
+    "${run[@]}"
+    return
   fi
   exec "${run[@]}"
 }
@@ -655,8 +672,8 @@ cmd_login() {
       return 0
       ;;
     both|all)
-      cmd_login anthropic
-      cmd_login codex
+      RALPH_RETURN_AFTER_RUN=1 cmd_login anthropic
+      RALPH_RETURN_AFTER_RUN=1 cmd_login codex
       return 0
       ;;
   esac
@@ -1154,5 +1171,6 @@ case "${1:-run}" in
   apply)    shift; cmd_apply "$@" ;;
   clean)    shift; cmd_clean "$@" ;;
   help|-h|--help) cmd_help ;;
-  *)        cmd_run "$@" ;;
+  *)        take_provider_flag "$@"
+            cmd_run ${RALPH_ARGV[@]+"${RALPH_ARGV[@]}"} ;;
 esac

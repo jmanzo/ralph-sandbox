@@ -35,9 +35,9 @@ anything else.)
 
 6. **If QA fails, count the attempts before you retry.** One failure gets one
    hand-back to the `developer` subagent, with QA's report and the attempt
-   count. But the budget is **three attempts at the same failure across the
-   whole run**, not three per iteration -- so before retrying anything, search
-   `.ralph/progress.md` for that failure's signature and add up what previous
+   count. But the budget is **three attempts at the same failure from this
+   provider**, not three per iteration -- so before retrying anything, search
+   `.ralph/progress.md` for that failure's signature and add up the Anthropic
    iterations already spent on it.
 
    - Attempts 1 and 2 remaining: hand it back once, then re-run QA.
@@ -112,8 +112,8 @@ resolve:
    ```
 
 **The loop compares these strings literally.** Three identical signatures in a
-row and it halts the whole run and alerts a human, which is the behaviour you
-want -- it is what stops an unattended loop from spending all night on one bug.
+row hand the wall to the fallback, or halt and alert a human when no fallback
+remains. That stops an unattended loop from spending all night on one bug.
 So:
 
 - Use the **same wording every time for the same failure**. Copy it from

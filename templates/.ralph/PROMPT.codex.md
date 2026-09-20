@@ -116,10 +116,11 @@ pre-existing. If it was already broken, say so -- it is still FAIL.
 
 ## The three-attempt rule
 
-A failure gets **three attempts across the whole run** -- not three per
-iteration, and not three fresh ones because the provider changed. Before
-retrying anything, search `.ralph/progress.md` for that failure's signature and
-add up what previous iterations already spent on it.
+A failure gets **three attempts from each provider** -- not three per
+iteration. A handover gives you a fresh Codex budget so you can try a different
+theory; Anthropic's attempts in `.ralph/progress.md` are evidence, not attempts
+charged to you. Before retrying anything, search the log for that failure's
+signature and add up the entries whose `Provider` is `codex`.
 
 - **Attempt 2**: your first theory was wrong. Do not retry a variation of it.
   Get new evidence first -- read the failing code path, print the actual
