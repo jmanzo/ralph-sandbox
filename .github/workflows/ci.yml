@@ -14,6 +14,85 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck ralph install.sh yolo-run.sh entrypoint.sh loop.sh
 
+  loop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scaffolding lands, and each role carries its model
+        run: |
+          mkdir -p /tmp/lp && cd /tmp/lp
+          git init -q . && git config user.email t@t && git config user.name t
+          "$GITHUB_WORKSPACE/ralph" init
+          test -f PRD.md && test -f .ralph/PROMPT.md
+          "$GITHUB_WORKSPACE/ralph" model | tee /tmp/models
+          grep -qE '^orchestrator +haiku'  /tmp/models
+          grep -qE '^architect +sonnet'    /tmp/models
+          grep -qE '^developer +opus'      /tmp/models
+          grep -qE '^qa +sonnet'           /tmp/models
+
+      - name: Escalating and degrading a role is one command
+        run: |
+          cd /tmp/lp
+          "$GITHUB_WORKSPACE/ralph" model developer sonnet
+          "$GITHUB_WORKSPACE/ralph" model | grep -qE '^developer +sonnet'
+          "$GITHUB_WORKSPACE/ralph" model developer opus
+          "$GITHUB_WORKSPACE/ralph" model | grep -qE '^developer +opus'
+          # the orchestrator is an env var, not a file, and says so
+          ! "$GITHUB_WORKSPACE/ralph" model orchestrator haiku 2>/dev/null
+
+      - name: The same failure three times halts the run and writes an alert
+        run: |
+          cd /tmp/lp
+          git add -A && git commit -qm init
+          cat > agent <<'AGENT'
+          #!/usr/bin/env bash
+          n=$(( $(cat .n 2>/dev/null || echo 0) + 1 )); echo "$n" > .n
+          echo "entry $n" >> .ralph/progress.md
+          git add -A >/dev/null 2>&1; git commit -qm "iter $n" >/dev/null 2>&1
+          printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0.10,"result":"stuck\n<blocked>npm test: expected 401, received 500</blocked>"}'
+          AGENT
+          chmod +x agent
+          rc=0
+          RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp \
+            bash "$GITHUB_WORKSPACE/loop.sh" 10 || rc=$?
+          echo "exit=$rc"
+          test "$rc" = 4
+          cat .ralph/alert.txt
+          grep -q "stuck on one failure" .ralph/alert.txt
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          assert d['exit'] == 4 and d['iterations'] == 3, d
+          print('alert json ok:', d['reason'])"
+
+      - name: A different failure each time does not halt the run
+        run: |
+          cd /tmp/lp && rm -f .n
+          cat > agent <<'AGENT'
+          #!/usr/bin/env bash
+          n=$(( $(cat .n 2>/dev/null || echo 0) + 1 )); echo "$n" > .n
+          echo "entry $n" >> .ralph/progress.md
+          git add -A >/dev/null 2>&1; git commit -qm "iter $n" >/dev/null 2>&1
+          printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"num_turns\":1,\"total_cost_usd\":0.10,\"result\":\"<blocked>failure number $n</blocked>\"}"
+          AGENT
+          chmod +x agent
+          rc=0
+          RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp \
+            bash "$GITHUB_WORKSPACE/loop.sh" 4 || rc=$?
+          test "$rc" = 3   # ran out of budget, i.e. it kept going
+
+      - name: The completion sigil ends the run
+        run: |
+          cd /tmp/lp && rm -f .n
+          cat > agent <<'AGENT'
+          #!/usr/bin/env bash
+          printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0.10,"result":"done\n<promise>COMPLETE</promise>"}'
+          AGENT
+          chmod +x agent
+          RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp bash "$GITHUB_WORKSPACE/loop.sh" 5
+          grep -q "finished the PRD" .ralph/alert.txt
+
   build:
     strategy:
       fail-fast: false

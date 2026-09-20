@@ -122,6 +122,67 @@ Between iterations the only things that survive are the git history and
 `.ralph/progress.md`. That's the whole discipline: context an agent didn't write
 down is context the next iteration doesn't have.
 
+### Who runs on what
+
+Spending is concentrated where the reasoning happens, not where the routing
+does:
+
+| Role | Model | Set in |
+| --- | --- | --- |
+| Orchestrator | `haiku` | `RALPH_MODEL_ORCHESTRATOR` |
+| Architect | `sonnet` | `.claude/agents/architect.md` |
+| Developer | `opus` | `.claude/agents/developer.md` |
+| QA | `sonnet` | `.claude/agents/qa.md` |
+
+```bash
+ralph model                      # what each role is running on right now
+ralph model developer sonnet     # start an MVP cheap
+ralph model developer opus       # escalate when the logic gets intricate
+```
+
+**Degrading deliberately.** For an MVP, run the developer on `sonnet` too and
+leave it there while the work is CRUD-shaped. Escalate to `opus` on evidence --
+intricate domain logic, a third-party integration failing in new ways each time,
+or the same signature coming back from QA more than once. Escalate the
+*developer* first: it is rarely the architect that is underpowered.
+
+One caveat worth knowing before you leave it running: the orchestrator is the
+role that decides the PRD is done and emits the completion sigil. On `haiku`
+that is the cheapest seat in the tree and also the one whose misjudgement is
+least recoverable. If a run ends suspiciously early, raise that one first.
+
+### Three strikes on the same failure
+
+Two agents trading one bug back and forth is the most expensive way for an
+unattended loop to achieve nothing. So the same failure gets **three attempts
+across the whole run** -- not three per iteration:
+
+- The **developer** is told how many attempts are left, and that attempt 3 is
+  the last anybody pays for.
+- **QA** reports whether a failure is the same one as last time, and whether the
+  last attempt changed the output at all.
+- The **orchestrator**, on giving up, ends its turn with a failure signature:
+  `<blocked>npm test -- auth.spec.ts: expected 401, received 500</blocked>`.
+
+The loop compares those signatures literally. Three identical ones running and
+it halts with exit `4` and alerts you, instead of buying another night of the
+same bug. A genuinely different failure resets the count.
+
+### Slack alerts
+
+```bash
+export RALPH_SLACK_WEBHOOK=https://hooks.slack.com/services/...
+ralph loop 20
+```
+
+One post per run, not per iteration, saying how it ended, how many iterations it
+took, what it cost, and what it was stuck on.
+
+**The post comes from the host, after the container exits.** The sandbox writes
+`.ralph/alert.txt` and nothing more, so Slack never goes on the egress allowlist
+and the webhook URL never enters the sandbox -- an allowlisted webhook is an
+exfiltration channel, and this buys the alerting without opening one.
+
 ### When the loop stops
 
 | Exit | Why |
@@ -130,6 +191,7 @@ down is context the next iteration doesn't have.
 | `1` | The agent process itself failed twice running (`RALPH_LOOP_FAILS`) |
 | `2` | Three iterations running changed nothing (`RALPH_LOOP_STALL`) |
 | `3` | The iteration budget ran out |
+| `4` | The same failure came back three iterations running (`RALPH_LOOP_REPEAT`) |
 
 The stall detector is the one that saves money. Each round it fingerprints
 `HEAD`, the working-tree diff and `progress.md`; a loop that is narrating rather
@@ -249,6 +311,7 @@ RALPH_MEMORY=8g RALPH_CPUS=4 ralph
 ralph [run] [args...]   Launch the agent over the current directory (default)
 ralph init [--force]    Scaffold the loop: PRD, prompt, state, subagents
 ralph loop [N]          Run the loop unattended, up to N iterations
+ralph model [role model]  Show, or change, the model behind each role
 ralph shell             Open a shell in the sandbox
 ralph status            Mode, network policy, images, volumes
 ralph build / update    Build images / rebuild with the latest agent
@@ -278,6 +341,9 @@ Environment variables, or `~/.config/ralph/config.env`:
 | `RALPH_LOOP_STALL` | `3` | Stop after this many iterations that change nothing |
 | `RALPH_LOOP_FAILS` | `2` | Stop after this many consecutive agent failures |
 | `RALPH_LOOP_SLEEP` | `0` | Seconds to pause between iterations |
+| `RALPH_LOOP_REPEAT` | `3` | Halt after this many repeats of one failure |
+| `RALPH_MODEL_ORCHESTRATOR` | `haiku` | Model behind the orchestrator |
+| `RALPH_SLACK_WEBHOOK` | -- | Posted from the host when a run ends |
 | `RALPH_IMAGE` | `ralph-sandbox` | Image tag |
 | `RALPH_HOME_VOLUME` | `ralph-home` | Volume holding the login |
 | `RALPH_WORKSPACE` | `$PWD` | Directory to sandbox |
@@ -340,8 +406,12 @@ Worth reading before you rely on this.
 - **The allowlist is only as tight as you make it.** Anything reachable is a
   possible destination for your source code.
 - **An unattended loop is still an unattended loop.** The budget, the stall
-  detector and the sandbox bound what it can cost and reach; they cannot make it
-  right. Read the diff before you ship it.
+  detector, the three-strikes rule and the sandbox bound what it can cost and
+  reach; they cannot make it right. Read the diff before you ship it.
+- **The three-strikes rule trusts the orchestrator's signature.** A model that
+  rephrases the same failure each time defeats the check, which is why the
+  prompt is emphatic about copying it verbatim. The iteration budget is the
+  backstop that does not depend on the model behaving.
 
 ## Troubleshooting
 

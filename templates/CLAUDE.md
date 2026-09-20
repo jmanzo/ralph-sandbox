@@ -22,6 +22,28 @@ below apply to every agent in it, orchestrator and subagents alike.
   A bad iteration is fixed by the next commit, not by erasing the last one.
 - **Write down what you learned.** A surprise that is not in
   `.ralph/progress.md` will surprise the next iteration too.
+- **Three attempts at the same failure, for the whole run.** Not three per
+  iteration. When they are spent, the run stops and a human is alerted. Two
+  agents trading the same error back and forth is the most expensive thing this
+  loop can do, and the least likely to work.
+
+## Who runs on what
+
+| Role | Model | Why |
+| --- | --- | --- |
+| Orchestrator | `haiku` | Routing and bookkeeping, not judgement |
+| Architect | `sonnet` | Design and sequencing |
+| Developer | `opus` | The reasoning is here; this is where the code gets written |
+| QA | `sonnet` | Running things and reporting precisely |
+
+Change one with `ralph model <role> <model>`; `ralph model` alone lists them.
+
+**Starting cheap.** For an MVP, run the developer on `sonnet` as well
+(`ralph model developer sonnet`) and leave it there while the work is
+CRUD-shaped. Escalate to `opus` when the evidence says to -- intricate domain
+logic, a third-party integration that keeps failing in new ways, or the same
+signature coming back from QA more than once. Escalate the *developer* first;
+it is rarely the architect that is underpowered, and never the orchestrator.
 
 ## Build and test
 

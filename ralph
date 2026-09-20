@@ -40,6 +40,20 @@ RALPH_LOOP_MAX="${RALPH_LOOP_MAX:-10}"
 RALPH_LOOP_SLEEP="${RALPH_LOOP_SLEEP:-0}"
 RALPH_LOOP_STALL="${RALPH_LOOP_STALL:-3}"
 RALPH_LOOP_FAILS="${RALPH_LOOP_FAILS:-2}"
+# Halt when the orchestrator reports the same failure this many iterations
+# running. Two agents trading one bug back and forth is the most expensive way
+# for an unattended loop to achieve nothing.
+RALPH_LOOP_REPEAT="${RALPH_LOOP_REPEAT:-3}"
+
+# The orchestrator routes and records; the subagents think. Its model is set
+# here because it is the session `ralph loop` starts. The other three live in
+# the project's .claude/agents/*.md -- see `ralph model`.
+RALPH_MODEL_ORCHESTRATOR="${RALPH_MODEL_ORCHESTRATOR:-haiku}"
+
+# Slack incoming-webhook URL. The alert is posted from the HOST, after the
+# container exits, so neither the URL nor Slack's hostname ever reaches the
+# sandbox and the egress allowlist stays as tight as it was.
+RALPH_SLACK_WEBHOOK="${RALPH_SLACK_WEBHOOK:-}"
 
 # Workspace isolation, mirroring Docker Sandboxes:
 #   direct -- host workspace bind-mounted read-write (live, and destructible)
@@ -404,6 +418,15 @@ cmd_run() {
 
   args+=(-v "$RALPH_HOME_VOLUME:/home/sandboxuser")
 
+  # The image bakes in a copy of the loop driver, but mount the repo's over it
+  # so the driver always matches the `ralph` that launched it. Editing loop.sh
+  # otherwise needs a rebuild to take effect, and the failure is silent: an old
+  # driver runs and quietly lacks the newer guardrails. Read-only, so the agent
+  # cannot rewrite its own supervisor.
+  if [ "${RALPH_ENTRY:-agent}" = "loop" ] && [ -f "$RALPH_ROOT/loop.sh" ]; then
+    args+=(-v "$RALPH_ROOT/loop.sh:/usr/local/bin/ralph-loop:ro")
+  fi
+
   # --- network policy -----------------------------------------------------
   if [ "$RALPH_NETWORK_POLICY" = "on" ]; then
     proxy_up
@@ -440,19 +463,33 @@ cmd_run() {
   [ -n "$RALPH_DOCKER_ARGS" ] && read -r -a extra <<<"$RALPH_DOCKER_ARGS"
 
   # Note: the host Docker socket is deliberately never mounted.
-  exec docker run --rm "${tty[@]}" \
-    --hostname ralph \
-    "${args[@]}" \
-    -w /workspace \
-    -e TERM="${TERM:-xterm-256color}" \
-    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-    -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}" \
-    -e RALPH_AGENT_CMD="$RALPH_AGENT_CMD" \
-    -e RALPH_LOOP_SLEEP="$RALPH_LOOP_SLEEP" \
-    -e RALPH_LOOP_STALL="$RALPH_LOOP_STALL" \
-    -e RALPH_LOOP_FAILS="$RALPH_LOOP_FAILS" \
-    ${extra[@]+"${extra[@]}"} \
-    "$RALPH_IMAGE" "${entry[@]}" "$@"
+  local run=(docker run --rm "${tty[@]}"
+    --hostname ralph
+    "${args[@]}"
+    -w /workspace
+    -e TERM="${TERM:-xterm-256color}"
+    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+    -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}"
+    -e RALPH_AGENT_CMD="$RALPH_AGENT_CMD"
+    -e RALPH_PROJECT="$RALPH_WORKSPACE"
+    -e RALPH_MODEL_ORCHESTRATOR="$RALPH_MODEL_ORCHESTRATOR"
+    -e RALPH_LOOP_SLEEP="$RALPH_LOOP_SLEEP"
+    -e RALPH_LOOP_STALL="$RALPH_LOOP_STALL"
+    -e RALPH_LOOP_FAILS="$RALPH_LOOP_FAILS"
+    -e RALPH_LOOP_REPEAT="$RALPH_LOOP_REPEAT"
+    ${extra[@]+"${extra[@]}"}
+    "$RALPH_IMAGE" "${entry[@]}" "$@")
+
+  # The loop is wrapped rather than exec'd, so the host survives the container
+  # and can post the alert the sandbox left behind. Everything else hands the
+  # terminal straight over.
+  if [ "${RALPH_ENTRY:-agent}" = "loop" ]; then
+    local rc=0
+    "${run[@]}" || rc=$?
+    loop_alert "$rc"
+    exit "$rc"
+  fi
+  exec "${run[@]}"
 }
 
 cmd_shell() { RALPH_ENTRY=shell cmd_run "$@"; }
@@ -499,6 +536,18 @@ cmd_status() {
     none)   printf '  (no host filesystem)\n' ;;
   esac
   printf 'agent         %s\n' "$RALPH_AGENT_CMD"
+  printf 'orchestrator  %s\n' "$RALPH_MODEL_ORCHESTRATOR"
+  if [ -d "$RALPH_WORKSPACE/.claude/agents" ]; then
+    printf 'subagents     %s\n' \
+      "$(cmd_model ls | sed 1d | awk '{printf "%s=%s ", $1, $2}')"
+  else
+    printf 'subagents     none  (ralph init)\n'
+  fi
+  if [ -n "$RALPH_SLACK_WEBHOOK" ]; then
+    printf 'slack         on  (alert posted from the host when a run ends)\n'
+  else
+    printf 'slack         off  (set RALPH_SLACK_WEBHOOK)\n'
+  fi
   if [ "$RALPH_NETWORK_POLICY" = "on" ]; then
     printf 'network       deny-by-default via proxy  (%s)\n' \
       "$(proxy_running && echo 'proxy up' || echo 'proxy will start on run')"
@@ -632,6 +681,87 @@ cmd_loop() {
   RALPH_ENTRY=loop cmd_run "$n" "$@"
 }
 
+# Read one file out of the agent's workspace, wherever that workspace lives.
+read_workspace_file() {
+  local rel="$1" ws_volume
+  case "$RALPH_MODE" in
+    direct)
+      [ -f "$RALPH_WORKSPACE/$rel" ] || return 1
+      cat "$RALPH_WORKSPACE/$rel"
+      ;;
+    *)
+      ws_volume="$(ws_volume_name)"
+      volume_exists "$ws_volume" || return 1
+      docker run --rm -v "$ws_volume:/workspace:ro" \
+        --entrypoint cat "$RALPH_IMAGE" "/workspace/$rel" 2>/dev/null
+      ;;
+  esac
+}
+
+# One post per run, not per iteration, describing how the loop ended.
+loop_alert() {
+  local rc="$1" text payload
+  [ -n "$RALPH_SLACK_WEBHOOK" ] || return 0
+
+  text="$(read_workspace_file .ralph/alert.txt 2>/dev/null || true)"
+  [ -n "$text" ] || text="ralph loop: exited $rc without writing an alert
+$RALPH_WORKSPACE"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl not found on the host, so the Slack alert was not sent"
+    return 0
+  fi
+
+  # Escape for JSON by hand: jq is not guaranteed on the host.
+  payload="$(printf '{"text":"%s"}' \
+    "$(printf '%s' "$text" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}')")"
+
+  if curl -fsS -m 15 -X POST -H 'Content-type: application/json' \
+       --data "$payload" "$RALPH_SLACK_WEBHOOK" >/dev/null 2>&1; then
+    info "alerted Slack"
+  else
+    warn "could not post the Slack alert (check RALPH_SLACK_WEBHOOK)"
+  fi
+}
+
+# Which model each role in the tree runs on. The orchestrator's is an env var
+# because it is this script that launches it; the subagents' models are
+# frontmatter in the project, which is also where you can read them.
+cmd_model() {
+  local dir="$RALPH_WORKSPACE/.claude/agents"
+  case "${1:-ls}" in
+    ls)
+      printf '%-14s %-10s %s\n' orchestrator "$RALPH_MODEL_ORCHESTRATOR" '(RALPH_MODEL_ORCHESTRATOR)'
+      if [ ! -d "$dir" ]; then
+        warn "no subagents in $RALPH_WORKSPACE -- run 'ralph init'"
+        return 0
+      fi
+      local f name model
+      for f in "$dir"/*.md; do
+        [ -e "$f" ] || continue
+        name="$(basename "$f" .md)"
+        model="$(sed -n 's/^model:[[:space:]]*//p' "$f" | head -1)"
+        printf '%-14s %-10s %s\n' "$name" "${model:-inherit}" ".claude/agents/$name.md"
+      done
+      ;;
+    *)
+      local role="$1" model="${2:-}" f
+      [ -n "$model" ] || die "usage: ralph model <role> <haiku|sonnet|opus|inherit>"
+      [ "$role" != "orchestrator" ] ||
+        die "the orchestrator's model is RALPH_MODEL_ORCHESTRATOR, not a file (env, or $RALPH_CONFIG)"
+      case "$model" in
+        haiku|sonnet|opus|inherit|claude-*) ;;
+        *) die "unexpected model '$model' (expected haiku, sonnet, opus, inherit, or a claude-* id)" ;;
+      esac
+      f="$dir/$role.md"
+      [ -f "$f" ] || die "no subagent '$role' in $dir"
+      grep -q '^model:' "$f" || die "$f has no 'model:' line to change"
+      sed "s/^model:.*/model: $model/" "$f" > "$f.ralph-tmp" && mv "$f.ralph-tmp" "$f"
+      info "$role now runs on $model"
+      ;;
+  esac
+}
+
 cmd_help() {
   cat <<'__HELP__'
 ralph -- run a coding agent in yolo mode inside a locked-down container.
@@ -640,6 +770,7 @@ COMMANDS
   ralph [run] [args...]   Launch the agent over the current directory (default)
   ralph init [--force]    Scaffold the Ralph loop: PRD, prompt, state, subagents
   ralph loop [N]          Run the loop unattended, up to N iterations
+  ralph model [role model]  Show, or change, the model behind each role
   ralph shell [args...]   Open a shell in the sandbox instead
   ralph status            Show mode, network policy, images and volumes
   ralph build [docker..]  Build the sandbox and proxy images
@@ -669,6 +800,11 @@ THE LOOP
   ralph loop 10           one task per iteration until the PRD is done, or 10
                           iterations pass, or the agent stops making progress
 
+  It also halts if the same failure comes back 3 iterations running, and posts
+  one Slack alert per run when RALPH_SLACK_WEBHOOK is set. Models per role:
+  ralph model developer sonnet   (cheap MVP)
+  ralph model developer opus     (escalate when the logic gets intricate)
+
 KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_MODE              direct | clone | none        [direct]
   RALPH_NETWORK_POLICY    on | off                     [on]
@@ -678,6 +814,9 @@ KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_LOOP_MAX          default iteration budget     [10]
   RALPH_LOOP_STALL        stop after N idle iterations [3]
   RALPH_LOOP_FAILS        stop after N agent failures  [2]
+  RALPH_LOOP_REPEAT       stop after N repeats of one failure  [3]
+  RALPH_MODEL_ORCHESTRATOR  model behind the orchestrator  [haiku]
+  RALPH_SLACK_WEBHOOK     posted from the host when a run ends  [unset]
   RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
   RALPH_MOUNT_GITCONFIG   [1]      RALPH_MOUNT_SSH     [0]
 
@@ -689,6 +828,7 @@ case "${1:-run}" in
   run)      shift || true; cmd_run "$@" ;;
   init)     shift; cmd_init "$@" ;;
   loop)     shift; cmd_loop "$@" ;;
+  model)    shift; cmd_model "$@" ;;
   shell)    shift; cmd_shell "$@" ;;
   build)    shift; cmd_build "$@" ;;
   update)   shift; cmd_update "$@" ;;

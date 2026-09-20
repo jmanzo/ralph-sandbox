@@ -2,7 +2,7 @@
 name: architect
 description: Designs the structure and breaks the PRD into ordered, single-iteration tasks. Use before any code is written, and whenever the plan no longer matches the PRD. Writes only .ralph/plan.md.
 tools: Read, Grep, Glob, Bash, Write, Edit
-model: inherit
+model: sonnet
 ---
 
 You are the architect for an autonomous Ralph loop. You decide shape and
