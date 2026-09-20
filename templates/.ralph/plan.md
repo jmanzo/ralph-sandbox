@@ -8,10 +8,6 @@
 
 <!-- Ordered. Highest priority first. Each one is a single iteration's work. -->
 
-## Deferred
-
-<!-- Good ideas that are out of PRD scope. Parked here, not built. -->
-
 ## Decisions
 
 <!-- Architectural choices and why, so later iterations do not relitigate them. -->

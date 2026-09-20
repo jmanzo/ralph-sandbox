@@ -76,13 +76,18 @@ Run `ralph status` at any time to see exactly what is in effect.
 cd ~/code/your-project
 ralph init            # scaffold the PRD, the prompt, the state files, the subagents
 $EDITOR PRD.md        # the only file you have to write by hand
-ralph loop 10         # up to 10 iterations, unattended
+ralph loop            # until the PRD is done, unattended
 ```
+
+There is no iteration count to pick. The run ends when the PRD is satisfied, or
+when one of the guardrails below decides it is not going to be. `ralph loop 10`
+still caps it, for when you want to sample the behaviour rather than finish.
 
 ### What `ralph init` lays down
 
 ```
 PRD.md                       what you're building, and how a machine can tell it's done
+PROPOSALS.md                 ideas the loop found but didn't build -- yours to promote
 CLAUDE.md                    conventions, plus the rules every agent in the loop follows
 .ralph/PROMPT.md             the orchestrator's prompt, run fresh every iteration
 .ralph/plan.md               the architect's ordered task list
@@ -121,6 +126,33 @@ is exactly this deep: no runaway fan-out while you're asleep.
 Between iterations the only things that survive are the git history and
 `.ralph/progress.md`. That's the whole discipline: context an agent didn't write
 down is context the next iteration doesn't have.
+
+### What it noticed but didn't build
+
+An agent held to one task will keep seeing things it was not asked to do. Left
+unmanaged those become scope creep; suppressed entirely, they are simply lost.
+They go to `PROPOSALS.md` instead.
+
+The developer and QA report what they saw; the orchestrator files it with the
+observation that prompted it, its rough size, and what it costs to keep
+ignoring it. Nothing there is implemented, and the loop never promotes anything
+into `PRD.md` -- that move is yours:
+
+```bash
+ralph loop                      # ... runs, finishes, or stops
+$EDITOR PROPOSALS.md            # read the shortlist
+# move what you want into PRD.md, delete it from PROPOSALS.md, run again
+```
+
+Two details that matter for an uncapped run. A proposal has to cite something
+that actually happened, not a best practice -- otherwise the file fills with
+boilerplate every night. And there is an *Already considered* section: ideas you
+declined go there, and the loop stops raising them.
+
+When a run finishes the PRD, the orchestrator's last act is to tidy the file --
+merge duplicates, drop what the finished work made moot, order by value. It is
+the one artefact of the run a human reads end to end, so it should read like a
+shortlist rather than a log.
 
 ### Who runs on what
 
@@ -168,20 +200,29 @@ The loop compares those signatures literally. Three identical ones running and
 it halts with exit `4` and alerts you, instead of buying another night of the
 same bug. A genuinely different failure resets the count.
 
-### Slack alerts
+### Notifications
+
+Set any of these -- each one that is set gets a copy:
 
 ```bash
 export RALPH_SLACK_WEBHOOK=https://hooks.slack.com/services/...
-ralph loop 20
+export RALPH_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+export RALPH_TELEGRAM_TOKEN=123456:ABC...   # and the chat to send to
+export RALPH_TELEGRAM_CHAT=-1001234567890
+
+ralph loop
 ```
 
-One post per run, not per iteration, saying how it ended, how many iterations it
-took, what it cost, and what it was stuck on.
+One message per run, not per iteration: how it ended, how many iterations it
+took, what it cost, and what it was stuck on. `RALPH_NOTIFY_ON=problem` sends
+only when a run ends badly; the default `always` also tells you when the PRD is
+finished, which is the message you actually want overnight.
 
-**The post comes from the host, after the container exits.** The sandbox writes
-`.ralph/alert.txt` and nothing more, so Slack never goes on the egress allowlist
-and the webhook URL never enters the sandbox -- an allowlisted webhook is an
-exfiltration channel, and this buys the alerting without opening one.
+**They are posted by the host, after the container exits.** The sandbox writes
+`.ralph/alert.txt` and nothing more. So no webhook URL and no bot token ever
+enters the sandbox, and none of these services go on the egress allowlist -- an
+allowlisted webhook is an exfiltration channel, and this buys the alerting
+without opening one.
 
 ### When the loop stops
 
@@ -190,8 +231,13 @@ exfiltration channel, and this buys the alerting without opening one.
 | `0` | The agent emitted `<promise>COMPLETE</promise>` -- the PRD is done |
 | `1` | The agent process itself failed twice running (`RALPH_LOOP_FAILS`) |
 | `2` | Three iterations running changed nothing (`RALPH_LOOP_STALL`) |
-| `3` | The iteration budget ran out |
+| `3` | An explicit iteration cap ran out (only if you passed one) |
 | `4` | The same failure came back three iterations running (`RALPH_LOOP_REPEAT`) |
+| `5` | Spending passed `RALPH_LOOP_MAX_COST` |
+
+Uncapped does not mean unbounded: `2`, `4` and `5` are what actually stop a run
+that is not going to finish. If you want a hard ceiling in dollars rather than
+iterations, that is `RALPH_LOOP_MAX_COST=25`.
 
 The stall detector is the one that saves money. Each round it fingerprints
 `HEAD`, the working-tree diff and `progress.md`; a loop that is narrating rather
@@ -206,7 +252,7 @@ iteration.
 ### Reviewing before anything lands
 
 ```bash
-RALPH_MODE=clone ralph loop 10   # the loop works on a private copy
+RALPH_MODE=clone ralph loop      # the loop works on a private copy
 ralph diff                       # read everything it did
 ralph apply                      # land it, snapshotting first
 ```
@@ -310,7 +356,7 @@ RALPH_MEMORY=8g RALPH_CPUS=4 ralph
 ```
 ralph [run] [args...]   Launch the agent over the current directory (default)
 ralph init [--force]    Scaffold the loop: PRD, prompt, state, subagents
-ralph loop [N]          Run the loop unattended, up to N iterations
+ralph loop [N]          Run until the PRD is done (N caps the iterations)
 ralph model [role model]  Show, or change, the model behind each role
 ralph shell             Open a shell in the sandbox
 ralph status            Mode, network policy, images, volumes
@@ -337,13 +383,17 @@ Environment variables, or `~/.config/ralph/config.env`:
 | `RALPH_MEMORY` / `RALPH_CPUS` | -- | Resource limits |
 | `RALPH_PIDS_LIMIT` | `2048` | Process cap |
 | `RALPH_AGENT_CMD` | `claude --dangerously-skip-permissions` | Command run inside |
-| `RALPH_LOOP_MAX` | `10` | Iterations when `ralph loop` is given no number |
+| `RALPH_LOOP_MAX` | `0` | Iteration cap; `0` means run until the PRD is done |
+| `RALPH_LOOP_MAX_COST` | -- | Stop once a run has spent this much (USD) |
 | `RALPH_LOOP_STALL` | `3` | Stop after this many iterations that change nothing |
 | `RALPH_LOOP_FAILS` | `2` | Stop after this many consecutive agent failures |
 | `RALPH_LOOP_SLEEP` | `0` | Seconds to pause between iterations |
 | `RALPH_LOOP_REPEAT` | `3` | Halt after this many repeats of one failure |
 | `RALPH_MODEL_ORCHESTRATOR` | `haiku` | Model behind the orchestrator |
-| `RALPH_SLACK_WEBHOOK` | -- | Posted from the host when a run ends |
+| `RALPH_SLACK_WEBHOOK` | -- | Slack incoming webhook |
+| `RALPH_DISCORD_WEBHOOK` | -- | Discord webhook |
+| `RALPH_TELEGRAM_TOKEN` / `_CHAT` | -- | Telegram bot token and chat id |
+| `RALPH_NOTIFY_ON` | `always` | `always`, or `problem` for bad endings only |
 | `RALPH_IMAGE` | `ralph-sandbox` | Image tag |
 | `RALPH_HOME_VOLUME` | `ralph-home` | Volume holding the login |
 | `RALPH_WORKSPACE` | `$PWD` | Directory to sandbox |

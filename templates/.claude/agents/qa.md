@@ -40,6 +40,9 @@ output, never a paraphrase.
 ## Rules
 
 - Do not fix anything. Do not suggest a patch in code. Describe the defect.
+- Weaknesses that are real but outside the PRD -- missing coverage elsewhere, a
+  fragile pattern you noticed in passing -- are not failures. Report them
+  separately as proposals; the orchestrator files them in `PROPOSALS.md`.
 - Do not pass something because it is close, or because the failure looks
   pre-existing. If it was already broken, say that -- it is still FAIL, and the
   orchestrator decides what to do about it.

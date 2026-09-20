@@ -22,7 +22,8 @@ else needs changing, say so in the plan and let the developer do it.
    - **Tasks**, ordered, highest priority first. Each task is *one iteration's
      work for one developer*: a few files, one coherent change, independently
      verifiable. If a task needs two sittings, split it.
-   - **Deferred**: out-of-scope ideas, parked so nobody builds them.
+   - Out-of-scope ideas do not belong in the plan at all. Hand them to the
+     orchestrator for `PROPOSALS.md`, and keep the plan to PRD work only.
    - **Decisions**: the architectural calls you made and why, so later
      iterations do not relitigate them.
 4. Order by dependency, then by risk. Things that unblock other things come
@@ -43,7 +44,9 @@ Each task states what done looks like and how to check it:
 ## Rules
 
 - Design for the PRD in front of you, not the system you imagine it becoming.
-  No abstraction whose second use case is hypothetical.
+  No abstraction whose second use case is hypothetical. The better version you
+  can see but were not asked for is a proposal, not a task -- say so and let it
+  be written down rather than building toward it.
 - Prefer what the codebase already does over what you would have chosen.
   Consistency beats your preference.
 - If the PRD is ambiguous enough that two designs are equally defensible, pick

@@ -40,4 +40,6 @@ Commands that must exit 0 before any task counts as done. QA runs these.
 
 ## Out of scope
 
-What the agent should leave alone, so it does not wander.
+What the agent should leave alone, so it does not wander. Anything it thinks
+belongs here anyway gets written to `PROPOSALS.md` for you to read, rather than
+built.

@@ -24,7 +24,7 @@ jobs:
           mkdir -p /tmp/lp && cd /tmp/lp
           git init -q . && git config user.email t@t && git config user.name t
           "$GITHUB_WORKSPACE/ralph" init
-          test -f PRD.md && test -f .ralph/PROMPT.md
+          test -f PRD.md && test -f .ralph/PROMPT.md && test -f PROPOSALS.md
           "$GITHUB_WORKSPACE/ralph" model | tee /tmp/models
           grep -qE '^orchestrator +haiku'  /tmp/models
           grep -qE '^architect +sonnet'    /tmp/models
@@ -81,6 +81,35 @@ jobs:
           RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp \
             bash "$GITHUB_WORKSPACE/loop.sh" 4 || rc=$?
           test "$rc" = 3   # ran out of budget, i.e. it kept going
+
+      - name: With no cap, the run continues until the PRD is done
+        run: |
+          cd /tmp/lp && rm -f .n
+          cat > agent <<'AGENT'
+          #!/usr/bin/env bash
+          n=$(( $(cat .n 2>/dev/null || echo 0) + 1 )); echo "$n" > .n
+          echo "entry $n" >> .ralph/progress.md
+          git add -A >/dev/null 2>&1; git commit -qm "iter $n" >/dev/null 2>&1
+          if [ "$n" -ge 7 ]; then done='\n<promise>COMPLETE</promise>'; else done=''; fi
+          printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"num_turns\":1,\"total_cost_usd\":0.50,\"result\":\"task $n$done\"}"
+          AGENT
+          chmod +x agent
+          # no iteration argument at all
+          RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp bash "$GITHUB_WORKSPACE/loop.sh"
+          python3 -c "
+          import json
+          d = json.load(open('.ralph/alert.json'))
+          assert d['exit'] == 0 and d['iterations'] == 7, d
+          print('ran uncapped to completion in', d['iterations'], 'iterations')"
+
+      - name: A spend ceiling stops an uncapped run
+        run: |
+          cd /tmp/lp && rm -f .n
+          rc=0
+          RALPH_AGENT_CMD=$PWD/agent RALPH_PROJECT=/tmp/lp RALPH_LOOP_MAX_COST=2 \
+            bash "$GITHUB_WORKSPACE/loop.sh" || rc=$?
+          test "$rc" = 5
+          grep -q "spend ceiling" .ralph/alert.txt
 
       - name: The completion sigil ends the run
         run: |
@@ -171,6 +200,68 @@ jobs:
           echo "$out" | grep -q "run 'ralph init'"
           out=$(docker run --rm ralph-sandbox bash -lc 'ralph-loop abc 2>&1' || true)
           echo "$out" | grep -q "must be a number"
+
+      - name: Slack, Discord and Telegram each get the end-of-run message
+        run: |
+          cat > /tmp/hook.py <<'PYEOF'
+          import http.server, sys, json
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  body = self.rfile.read(int(self.headers["Content-Length"]))
+                  with open("/tmp/hooks.jsonl", "a") as f:
+                      f.write(json.dumps({"path": self.path, "body": json.loads(body)}) + "\n")
+                  self.send_response(200); self.end_headers(); self.wfile.write(b'{"ok":true}')
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 8900), H).serve_forever()
+          PYEOF
+          rm -f /tmp/hooks.jsonl && touch /tmp/hooks.jsonl
+          # Detach its output, or anything capturing this step's stdout waits
+          # on a pipe the server keeps open.
+          python3 /tmp/hook.py >/dev/null 2>&1 &
+          HOOK=$!
+          trap 'kill "$HOOK" 2>/dev/null || true' EXIT
+          sleep 2
+
+          rm -rf /tmp/np && mkdir -p /tmp/np && cd /tmp/np
+          git init -q . && git config user.email t@t && git config user.name t
+          "$GITHUB_WORKSPACE/ralph" init >/dev/null
+          cat > agent <<'AGENT'
+          #!/usr/bin/env bash
+          printf '%s\n' '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0.10,"result":"done\n<promise>COMPLETE</promise>"}'
+          AGENT
+          chmod +x agent
+          git add -A && git commit -qm init
+
+          # The notification is posted by the HOST, so 127.0.0.1 is reachable
+          # even though the sandbox itself has no route to it.
+          RALPH_WORKSPACE=/tmp/np RALPH_NETWORK_POLICY=off RALPH_AGENT_CMD=/workspace/agent \
+            RALPH_SLACK_WEBHOOK=http://127.0.0.1:8900/slack \
+            RALPH_DISCORD_WEBHOOK=http://127.0.0.1:8900/discord \
+            RALPH_TELEGRAM_TOKEN=123:ABC RALPH_TELEGRAM_CHAT=-100999 \
+            RALPH_TELEGRAM_API=http://127.0.0.1:8900 \
+            "$GITHUB_WORKSPACE/ralph" loop
+          sleep 2
+          cat /tmp/hooks.jsonl
+          python3 -c "
+          import json
+          rows = [json.loads(l) for l in open('/tmp/hooks.jsonl')]
+          paths = sorted(r['path'] for r in rows)
+          assert paths == ['/bot123:ABC/sendMessage', '/discord', '/slack'], paths
+          by = {r['path']: r['body'] for r in rows}
+          assert 'text' in by['/slack']
+          assert 'content' in by['/discord']
+          assert by['/bot123:ABC/sendMessage']['chat_id'] == '-100999'
+          assert all('finished the PRD' in json.dumps(b) for b in by.values())
+          print('all three channels delivered')"
+
+      - name: A webhook is never reachable from inside the sandbox
+        run: |
+          # The egress policy is what makes host-side posting worth the bother.
+          ./ralph proxy up
+          ./ralph policy test hooks.slack.com | tee /tmp/p
+          grep -q "BLOCKED" /tmp/p
+          ./ralph policy test api.telegram.org | tee /tmp/q
+          grep -q "BLOCKED" /tmp/q
 
       - name: Host Docker socket is never exposed
         run: |

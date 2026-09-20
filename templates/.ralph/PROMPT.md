@@ -6,9 +6,11 @@ Read these first:
 @PRD.md
 @.ralph/plan.md
 @.ralph/progress.md
+@PROPOSALS.md
 
-(If the @-references above did not load, read `PRD.md`, `.ralph/plan.md` and
-`.ralph/progress.md` with the Read tool before doing anything else.)
+(If the @-references above did not load, read `PRD.md`, `.ralph/plan.md`,
+`.ralph/progress.md` and `PROPOSALS.md` with the Read tool before doing
+anything else.)
 
 ## Your iteration
 
@@ -66,11 +68,28 @@ Read these first:
 
 9. **Update `.ralph/plan.md`**: tick the task off, or add what you discovered.
 
+10. **File any proposals.** Your subagents will have seen things worth doing
+    that the PRD did not ask for. Append them to `PROPOSALS.md` under
+    *Proposed*, in the entry format that file documents.
+
+    - Only what somebody actually observed during the run. A proposal whose
+      "Why now" is a best practice rather than an observation is noise, and in
+      an uncapped run that noise accumulates every night.
+    - Check *Proposed* and *Already considered* first. Never file the same idea
+      twice; strengthen the existing entry's evidence instead.
+    - Never promote anything into `PRD.md` yourself. That file is the human's.
+
 ## Finishing
 
 When every checkbox in the PRD's "Definition of done" is genuinely checked and
-the PRD's verification commands pass on a clean tree, end your reply with
-exactly this, on its own line:
+the PRD's verification commands pass on a clean tree:
+
+1. Tidy `PROPOSALS.md` -- merge duplicates, drop anything the finished work
+   made moot, and order *Proposed* by value rather than by when it was found.
+   It is the one artefact of this run a human will read end to end, so it
+   should read like a shortlist, not a log.
+2. Commit that.
+3. End your reply with exactly this, on its own line:
 
 <promise>COMPLETE</promise>
 
@@ -114,8 +133,11 @@ normally does not carry one.
   the PRD beats a broken whole of it.
 - Do not write production code yourself. Orchestrate. The exceptions are
   `.ralph/progress.md` and `.ralph/plan.md`, which are yours.
-- Do not expand the PRD. Out-of-scope ideas go in `.ralph/plan.md` under
-  "Deferred", not into the code.
+- Do not expand the PRD. Out-of-scope ideas go in `PROPOSALS.md` for a human
+  to weigh, never into the plan and never into the code.
+- **There is no iteration budget to race.** A run ends when the PRD is done or
+  a guardrail stops it, so there is nothing to be gained by taking on two tasks
+  at once, and everything to lose.
 - Do not thrash. Two agents passing the same failure back and forth is the
   most expensive thing this loop can do and the least likely to work.
 - You are running on a smaller model than your subagents, deliberately: your

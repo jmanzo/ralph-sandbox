@@ -10,7 +10,7 @@
 #
 set -uo pipefail
 
-MAX="${1:-${RALPH_LOOP_MAX:-10}}"
+MAX="${1:-${RALPH_LOOP_MAX:-0}}"
 PROMPT_FILE="${RALPH_PROMPT_FILE:-.ralph/PROMPT.md}"
 PROGRESS_FILE="${RALPH_PROGRESS_FILE:-.ralph/progress.md}"
 LOG_DIR="${RALPH_LOG_DIR:-.ralph/logs}"
@@ -19,6 +19,7 @@ SLEEP="${RALPH_LOOP_SLEEP:-0}"
 STALL_LIMIT="${RALPH_LOOP_STALL:-3}"
 FAIL_LIMIT="${RALPH_LOOP_FAILS:-2}"
 REPEAT_LIMIT="${RALPH_LOOP_REPEAT:-3}"
+MAX_COST="${RALPH_LOOP_MAX_COST:-}"
 MODEL="${RALPH_MODEL_ORCHESTRATOR:-}"
 ALERT_JSON="${RALPH_ALERT_JSON:-.ralph/alert.json}"
 ALERT_TXT="${RALPH_ALERT_TXT:-.ralph/alert.txt}"
@@ -29,10 +30,12 @@ say()  { printf '\033[36m==> %s\033[0m\n' "$*" >&2; }
 warn() { printf '\033[33mralph-loop: %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31mralph-loop: %s\033[0m\n' "$*" >&2; exit 1; }
 
+# 0 means what it says: keep going until the PRD is done or a guardrail trips.
+# That is the normal way to run this -- a cap is for when you want to sample.
 case "$MAX" in
-  ''|*[!0-9]*) die "iteration budget must be a number, got '$MAX'" ;;
+  unlimited|none|inf) MAX=0 ;;
+  ''|*[!0-9]*) die "iteration cap must be a number, or 0 for no cap, got '$MAX'" ;;
 esac
-[ "$MAX" -gt 0 ] || die "iteration budget must be at least 1"
 [ -f "$PROMPT_FILE" ] || die "no $PROMPT_FILE here -- run 'ralph init' on the host first"
 
 USE_JQ=0
@@ -179,12 +182,16 @@ summary() {
 }
 trap 'printf "\n"; warn "interrupted"; finish 130 "interrupted by hand"' INT
 
-while [ "$iteration" -lt "$MAX" ]; do
+while [ "$MAX" -eq 0 ] || [ "$iteration" -lt "$MAX" ]; do
   iteration=$((iteration + 1))
   stamp="$(date +%Y%m%d-%H%M%S)"
   log="$LOG_DIR/$(printf '%03d' "$iteration")-$stamp.jsonl"
 
-  say "iteration $iteration/$MAX  ($stamp)"
+  if [ "$MAX" -eq 0 ]; then
+    say "iteration $iteration  ($stamp)"
+  else
+    say "iteration $iteration/$MAX  ($stamp)"
+  fi
 
   "${AGENT[@]}" -p "$PROMPT" --output-format stream-json --verbose 2>&1 \
     | tee "$log" | pretty
@@ -210,6 +217,14 @@ while [ "$iteration" -lt "$MAX" ]; do
   if completed "$log"; then
     say "the agent reports the PRD is done"
     finish 0 "finished the PRD"
+  fi
+
+  # With no iteration cap, the spend ceiling is the other end of the leash.
+  if [ -n "$MAX_COST" ] \
+     && awk -v a="$total_cost" -v b="$MAX_COST" 'BEGIN { exit !(a + 0 >= b + 0) }'; then
+    warn "spent \$$total_cost, at or past the \$$MAX_COST ceiling"
+    finish 5 "hit the \$$MAX_COST spend ceiling" \
+      "\$$total_cost over $iteration iteration(s); the PRD is not finished"
   fi
 
   # Has the orchestrator given up on the same thing it gave up on last time?
@@ -247,5 +262,6 @@ while [ "$iteration" -lt "$MAX" ]; do
   [ "$SLEEP" -gt 0 ] && sleep "$SLEEP"
 done
 
-say "iteration budget of $MAX reached without a completion signal"
-finish 3 "ran out of iterations" "budget of $MAX spent; raise it or narrow the PRD"
+say "iteration cap of $MAX reached without a completion signal"
+finish 3 "ran out of iterations" \
+  "cap of $MAX spent; raise it, drop it for an uncapped run, or narrow the PRD"

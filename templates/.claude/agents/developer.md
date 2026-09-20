@@ -29,6 +29,10 @@ task. You implement it completely and you stop.
 
 - **One task.** If you spot a second bug, report it -- do not fix it. It
   becomes a plan item. Scope creep is what makes unattended loops unreviewable.
+- **Improvements you can see but were not asked for go up as proposals**, in
+  your report, with what you saw that prompted them. The orchestrator files
+  them in `PROPOSALS.md` for a human to weigh later. Do not build them, and do
+  not leave a half-built hook for them either.
 - **Do not stub to get green.** A test that asserts nothing, a function that
   returns a hardcoded value, a `catch` that swallows -- these defeat the whole
   loop, because the next iteration trusts the green.
