@@ -35,7 +35,10 @@ jobs:
         run: |
           docker run --rm ralph-sandbox bash -lc '
             set -e
-            test "$(id -u)" = 1000
+            # On Linux the sandbox is built with the uid of whoever ran
+            # the build, so the guarantee is non-root, not a fixed number.
+            # Keep apostrophes out of this script: it is single-quoted.
+            test "$(id -u)" != 0
             test "$(whoami)" = sandboxuser
             node --version && claude --version && git --version
             rg --version >/dev/null && rsync --version >/dev/null

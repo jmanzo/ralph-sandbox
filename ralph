@@ -311,18 +311,49 @@ build_proxy() {
   docker build -t "$RALPH_PROXY_IMAGE" "$RALPH_ROOT/proxy"
 }
 
+# In direct mode the host workspace is bind-mounted, and on Linux a bind mount
+# keeps the host's real uid. A sandbox user that doesn't match it cannot write
+# to the workspace it was given -- the agent dies on its first commit with
+# "Permission denied". So the image is built with the invoking user's ids.
+#
+# Docker Desktop virtualises bind-mount ownership, so macOS hosts don't have
+# the problem and stay on the image default. That keeps the common case
+# reproducible, and confines a host-specific image to the hosts that need one.
+build_uid_args() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  printf '%s\n' --build-arg "SANDBOX_UID=$(id -u)" --build-arg "SANDBOX_GID=$(id -g)"
+}
+
+# The home volume holds the agent's login and is created on first run, owned by
+# whatever uid the image had then. Rebuilding under a different uid leaves it
+# unwritable, which looks like a broken login rather than a stale volume.
+warn_stale_home() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  volume_exists "$RALPH_HOME_VOLUME" || return 0
+  local owner
+  owner="$(docker run --rm -v "$RALPH_HOME_VOLUME:/h" --entrypoint stat "$RALPH_IMAGE" \
+             -c '%u' /h 2>/dev/null)" || return 0
+  [ -n "$owner" ] && [ "$owner" != "$(id -u)" ] || return 0
+  warn "$RALPH_HOME_VOLUME is owned by uid $owner but the sandbox now runs as $(id -u)"
+  warn "the agent will not be able to write its login -- run: ralph clean volume"
+}
+
 cmd_build() {
   info "building $RALPH_IMAGE"
-  docker build "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+  local uid_args=() ; while IFS= read -r a; do uid_args+=("$a"); done < <(build_uid_args)
+  docker build ${uid_args[@]+"${uid_args[@]}"} "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
   build_proxy
+  warn_stale_home
 }
 
 cmd_update() {
   info "rebuilding from scratch with the latest agent"
-  docker build --pull --no-cache "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+  local uid_args=() ; while IFS= read -r a; do uid_args+=("$a"); done < <(build_uid_args)
+  docker build --pull --no-cache ${uid_args[@]+"${uid_args[@]}"} "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
   cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ROOT/proxy/default.allowlist"
   docker build --pull --no-cache -t "$RALPH_PROXY_IMAGE" "$RALPH_ROOT/proxy"
   proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
+  warn_stale_home
   return 0
 }
 
