@@ -483,7 +483,12 @@ cmd_build() {
 cmd_update() {
   info "rebuilding from scratch with the latest agents (claude and codex)"
   local uid_args=() ; while IFS= read -r a; do uid_args+=("$a"); done < <(build_uid_args)
-  docker build --pull --no-cache ${uid_args[@]+"${uid_args[@]}"} "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+  # The Dockerfile pins both agents so `ralph build` is reproducible; update
+  # is the one command that deliberately asks for whatever npm has today.
+  # Your own --build-arg comes later on the line and wins.
+  docker build --pull --no-cache ${uid_args[@]+"${uid_args[@]}"} \
+    --build-arg CLAUDE_VERSION=latest --build-arg CODEX_VERSION=latest \
+    "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
   cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ROOT/proxy/default.allowlist"
   docker build --pull --no-cache -t "$RALPH_PROXY_IMAGE" "$RALPH_ROOT/proxy"
   proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
