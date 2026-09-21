@@ -17,7 +17,38 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck ralph install.sh yolo-run.sh entrypoint.sh loop.sh
+      - run: shellcheck ralph install.sh yolo-run.sh entrypoint.sh loop.sh proxy/entrypoint.sh
+      - name: Shell and config files are ASCII only
+        run: |
+          # The rule from CONTRIBUTING.md, enforced. A smart quote in a
+          # heredoc is the kind of thing that only breaks on someone else's
+          # locale.
+          ! LC_ALL=C grep -nP '[^\x00-\x7F]' \
+              ralph install.sh yolo-run.sh entrypoint.sh loop.sh \
+              Dockerfile proxy/Dockerfile proxy/entrypoint.sh proxy/tinyproxy.conf \
+              policy/default.allowlist
+
+  scan:
+    # Informational for now: it reports, it does not block. Flip exit-code
+    # to 1 once the baseline is clean and stays that way.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: ./ralph build
+      - name: Scan the sandbox image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ralph-sandbox
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 0
+      - name: Scan the proxy image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ralph-proxy
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 0
 
   loop:
     runs-on: ubuntu-latest
