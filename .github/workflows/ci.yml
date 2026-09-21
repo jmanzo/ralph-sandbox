@@ -6,18 +6,23 @@ on:
   pull_request:
   workflow_dispatch:
 
+# The token only ever needs to read the checkout. Anything that later needs
+# more (publishing images, say) should ask for it on its own job, not here.
+permissions:
+  contents: read
+
 jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck ralph install.sh yolo-run.sh entrypoint.sh loop.sh
 
   loop:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Scaffolding lands, and each role carries its model
         run: |
@@ -288,7 +293,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     name: build (${{ matrix.arch }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Build images
         run: ./ralph build
