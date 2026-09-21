@@ -1106,6 +1106,19 @@ cmd_model() {
   esac
 }
 
+# The release number lives in VERSION; a git checkout adds what `git describe`
+# knows on top, so a bug report can name the exact commit.
+cmd_version() {
+  local v="unknown" g
+  [ -f "$RALPH_ROOT/VERSION" ] && v="$(tr -d '[:space:]' < "$RALPH_ROOT/VERSION")"
+  g="$(git -C "$RALPH_ROOT" describe --tags --always --dirty 2>/dev/null || true)"
+  if [ -n "$g" ] && [ "$g" != "v$v" ]; then
+    printf 'ralph %s (%s)\n' "$v" "$g"
+  else
+    printf 'ralph %s\n' "$v"
+  fi
+}
+
 cmd_help() {
   cat <<'__HELP__'
 ralph -- run a coding agent in yolo mode inside a locked-down container.
@@ -1120,6 +1133,7 @@ COMMANDS
   ralph status            Show mode, network policy, images and volumes
   ralph build [docker..]  Build the sandbox and proxy images
   ralph update            Rebuild from scratch with the latest agents
+  ralph version           Release number and, from a checkout, the commit
 
   ralph policy ls         Show the egress allowlist
   ralph policy edit       Edit it, then restart the proxy
@@ -1218,6 +1232,7 @@ case "${1:-run}" in
   apply)    shift; cmd_apply "$@" ;;
   clean)    shift; cmd_clean "$@" ;;
   help|-h|--help) cmd_help ;;
+  version|-v|--version) cmd_version ;;
   *)        take_provider_flag "$@"
             cmd_run ${RALPH_ARGV[@]+"${RALPH_ARGV[@]}"} ;;
 esac
