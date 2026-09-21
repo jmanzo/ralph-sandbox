@@ -12,10 +12,11 @@ FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6
 RUN apk add --no-cache tinyproxy ca-certificates
 
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY entrypoint.sh /usr/local/bin/ralph-proxy-entrypoint
 
 # The allowlist is bind-mounted at runtime so `ralph policy` takes effect on a
 # proxy restart, with no image rebuild. This copy is only a fallback.
 COPY default.allowlist /etc/tinyproxy/allowlist
 
 EXPOSE 8888
-ENTRYPOINT ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
+ENTRYPOINT ["/usr/local/bin/ralph-proxy-entrypoint"]

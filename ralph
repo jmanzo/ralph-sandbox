@@ -254,12 +254,20 @@ proxy_up() {
   if proxy_running; then return 0; fi
   docker rm -f "$RALPH_PROXY_NAME" >/dev/null 2>&1 || true
 
+  # The proxy is on the egress bridge too, so it says which clients it will
+  # serve: the sandbox network's subnet, and nothing else that happens to be
+  # on that bridge.
+  local subnet
+  subnet="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$RALPH_INTERNAL_NET" 2>/dev/null)"
+  [ -n "${subnet// /}" ] || die "cannot read the subnet of $RALPH_INTERNAL_NET"
+
   info "starting egress proxy (deny-by-default)"
   # create -> connect -> start. Attaching the second network to an already
   # running container races against Docker setting up its network sandbox.
   docker create --name "$RALPH_PROXY_NAME" \
     --network "$RALPH_INTERNAL_NET" --network-alias proxy \
     --restart unless-stopped \
+    -e "ALLOW_FROM=$subnet" \
     -v "$RALPH_ALLOWLIST:/etc/tinyproxy/allowlist:ro" \
     "$RALPH_PROXY_IMAGE" >/dev/null
   docker network connect "$RALPH_EGRESS_NET" "$RALPH_PROXY_NAME"
