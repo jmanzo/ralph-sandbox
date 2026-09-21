@@ -467,6 +467,7 @@ ralph model [role model]  Show, or change, the model behind each role
 ralph shell             Open a shell in the sandbox
 ralph status            Provider, logins, mode, network policy, images, volumes
 ralph build / update    Build images / rebuild with the latest agents
+ralph version           Release number and, from a checkout, the commit
 ralph policy   <ls|edit|sync|test HOST|reset>
 ralph snapshot <ls|create|restore [ID]>
 ralph diff / apply      Clone mode: review and land changes
