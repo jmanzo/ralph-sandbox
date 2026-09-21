@@ -18,7 +18,7 @@ nothing to trust that you can't read in ten minutes.
 
 **Status: early, and used daily.** There is no tagged release yet; `ralph
 version` tells you which commit you are on. CI builds and tests the boundary
-on Linux amd64 and arm64. macOS (Apple Silicon, Docker Desktop and OrbStack)
+on Linux amd64 and arm64. macOS on Apple Silicon with Docker Desktop
 is where it is developed and run; Windows and WSL are untested. Pinned agent
 versions are in the `Dockerfile`; `ralph update` fetches newer ones. Read
 [docs/security.md](docs/security.md) before you rely on it.
