@@ -1,0 +1,41 @@
+name: Bug report
+description: Something ralph does that it should not, or does not do that it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If this is about the sandbox boundary not holding -- reaching a host off the allowlist, touching the host outside the workspace, reaching the Docker daemon -- please use the private security form linked from the issue chooser instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got. Paste the exact error text rather than describing it.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: ralph version and status
+      description: The output of `ralph version` and `ralph status`, run from the workspace where it happened. Redact anything you consider private.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      description: OS and Docker runtime, e.g. `macOS 15 / Docker Desktop 4.40`, `Ubuntu 24.04 / Docker Engine 27`, `macOS / Colima`.
+    validations:
+      required: true
+  - type: textarea
+    id: loop
+    attributes:
+      label: If it happened during a loop
+      description: The contents of `.ralph/alert.json` and the `.last.txt` of the iteration in question, from `.ralph/logs/`. Transcripts can contain your source code; check before pasting.
+      render: json
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Custom allowlist entries, `RALPH_DOCKER_ARGS`, a non-default `config.env`, extra build args.
