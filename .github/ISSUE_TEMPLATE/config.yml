@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/jmanzo/ralph-sandbox/security/advisories/new
+    about: Anything that lets an agent escape, exfiltrate or persist. Report it privately here, not as an issue.

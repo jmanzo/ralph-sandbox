@@ -11,6 +11,22 @@ SOURCE_DIR=/run/sandbox/source
 # create them here, on every start, where an upgraded install is covered too.
 mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}" 2>/dev/null || true
 
+# API keys arrive in a file the host mounted read-only, never as `docker run
+# -e` values, so they are not in the container config for `docker inspect`
+# to print. Export them here and the agent finds them in its environment as
+# usual.
+if [ -r /run/ralph/secrets.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . /run/ralph/secrets.env
+  set +a
+elif [ -e /run/ralph/secrets.env ]; then
+  # Mounted but unreadable: a Linux host whose uid the image was not built
+  # with. Say so, or the agent fails on its first call with no explanation.
+  echo "==> /run/ralph/secrets.env is not readable by $(id -u); API keys from the host will be missing" >&2
+  echo "==> rebuild with: ralph build --build-arg SANDBOX_UID=\$(id -u) --build-arg SANDBOX_GID=\$(id -g)" >&2
+fi
+
 # Clone mode: the host workspace is mounted read-only at $SOURCE_DIR and the
 # agent works in a private copy at /workspace. Seed it once, then leave it
 # alone so the agent's work survives restarts.

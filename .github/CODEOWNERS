@@ -1,0 +1,19 @@
+# Review is requested from the owner automatically once the branch ruleset
+# requires it. The boundary files are listed on their own so the intent is
+# visible: a change to any of them is a change to what the sandbox can reach.
+
+*                       @jmanzo
+
+# The boundary
+/ralph                  @jmanzo
+/loop.sh                @jmanzo
+/entrypoint.sh          @jmanzo
+/Dockerfile             @jmanzo
+/proxy/                 @jmanzo
+/policy/                @jmanzo
+
+# What every user's project is scaffolded from
+/templates/             @jmanzo
+
+# CI is what proves the boundary holds
+/.github/               @jmanzo

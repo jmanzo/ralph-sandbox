@@ -207,6 +207,32 @@ ws_volume_name() {
   esac
 }
 
+# API keys go into the sandbox through a file mounted read-only, not through
+# `docker run -e`. An environment variable is recorded in the container's
+# config, where `docker inspect` shows it to anyone who can talk to the
+# daemon; a file with mode 600 in the user's own data directory is not. The
+# entrypoint sources it before handing off, so the agent still finds the key
+# where it expects to.
+RALPH_SECRETS_FILE=""
+secrets_write() {
+  [ -n "${ANTHROPIC_API_KEY:-}${OPENAI_API_KEY:-}" ] || return 0
+  local dir="$_data_home/run"
+  mkdir -p "$dir" && chmod 700 "$dir"
+  RALPH_SECRETS_FILE="$(mktemp "$dir/secrets.XXXXXX")"
+  chmod 600 "$RALPH_SECRETS_FILE"
+  # %q quotes for bash, which is what sources the file in the entrypoint.
+  {
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then printf 'ANTHROPIC_API_KEY=%q\n' "$ANTHROPIC_API_KEY"; fi
+    if [ -n "${OPENAI_API_KEY:-}" ];    then printf 'OPENAI_API_KEY=%q\n'    "$OPENAI_API_KEY"; fi
+  } > "$RALPH_SECRETS_FILE"
+  trap secrets_drop EXIT
+}
+secrets_drop() {
+  [ -n "$RALPH_SECRETS_FILE" ] && rm -f "$RALPH_SECRETS_FILE"
+  RALPH_SECRETS_FILE=""
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Egress policy
 # ---------------------------------------------------------------------------
@@ -228,12 +254,20 @@ proxy_up() {
   if proxy_running; then return 0; fi
   docker rm -f "$RALPH_PROXY_NAME" >/dev/null 2>&1 || true
 
+  # The proxy is on the egress bridge too, so it says which clients it will
+  # serve: the sandbox network's subnet, and nothing else that happens to be
+  # on that bridge.
+  local subnet
+  subnet="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$RALPH_INTERNAL_NET" 2>/dev/null)"
+  [ -n "${subnet// /}" ] || die "cannot read the subnet of $RALPH_INTERNAL_NET"
+
   info "starting egress proxy (deny-by-default)"
   # create -> connect -> start. Attaching the second network to an already
   # running container races against Docker setting up its network sandbox.
   docker create --name "$RALPH_PROXY_NAME" \
     --network "$RALPH_INTERNAL_NET" --network-alias proxy \
     --restart unless-stopped \
+    -e "ALLOW_FROM=$subnet" \
     -v "$RALPH_ALLOWLIST:/etc/tinyproxy/allowlist:ro" \
     "$RALPH_PROXY_IMAGE" >/dev/null
   docker network connect "$RALPH_EGRESS_NET" "$RALPH_PROXY_NAME"
@@ -483,7 +517,12 @@ cmd_build() {
 cmd_update() {
   info "rebuilding from scratch with the latest agents (claude and codex)"
   local uid_args=() ; while IFS= read -r a; do uid_args+=("$a"); done < <(build_uid_args)
-  docker build --pull --no-cache ${uid_args[@]+"${uid_args[@]}"} "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+  # The Dockerfile pins both agents so `ralph build` is reproducible; update
+  # is the one command that deliberately asks for whatever npm has today.
+  # Your own --build-arg comes later on the line and wins.
+  docker build --pull --no-cache ${uid_args[@]+"${uid_args[@]}"} \
+    --build-arg CLAUDE_VERSION=latest --build-arg CODEX_VERSION=latest \
+    "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
   cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ROOT/proxy/default.allowlist"
   docker build --pull --no-cache -t "$RALPH_PROXY_IMAGE" "$RALPH_ROOT/proxy"
   proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
@@ -573,8 +612,17 @@ cmd_run() {
   local tty=(-i)
   [ -t 0 ] && [ -t 1 ] && tty=(-it)
 
+  # Split like a shell would, so a quoted value survives:
+  #   RALPH_DOCKER_ARGS="-e FOO='a b' --label x=y"
+  # read -a splits on whitespace and would hand docker three broken words.
+  # config.env is already sourced, so evaluating a value from it adds no trust
+  # that was not already given.
   local extra=()
-  [ -n "$RALPH_DOCKER_ARGS" ] && read -r -a extra <<<"$RALPH_DOCKER_ARGS"
+  # shellcheck disable=SC2294
+  [ -n "$RALPH_DOCKER_ARGS" ] && eval "extra=($RALPH_DOCKER_ARGS)"
+
+  secrets_write
+  [ -n "$RALPH_SECRETS_FILE" ] && args+=(-v "$RALPH_SECRETS_FILE:/run/ralph/secrets.env:ro")
 
   # Note: the host Docker socket is deliberately never mounted.
   local run=(docker run --rm "${tty[@]}"
@@ -582,9 +630,7 @@ cmd_run() {
     "${args[@]}"
     -w /workspace
     -e TERM="${TERM:-xterm-256color}"
-    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
     -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}"
-    -e OPENAI_API_KEY="${OPENAI_API_KEY:-}"
     -e RALPH_AGENT_CMD="$RALPH_AGENT_CMD"
     -e RALPH_PROJECT="$RALPH_WORKSPACE"
     -e RALPH_MODEL_ORCHESTRATOR="$RALPH_MODEL_ORCHESTRATOR"
@@ -602,19 +648,20 @@ cmd_run() {
     ${extra[@]+"${extra[@]}"}
     "$RALPH_IMAGE" "${entry[@]}" "$@")
 
-  # The loop is wrapped rather than exec'd, so the host survives the container
-  # and can post the alert the sandbox left behind. Combined login also has to
-  # return so it can start the second provider.
+  # The container is a child rather than an exec, so the host survives it:
+  # to remove the secrets file, to post the alert a loop left behind, and so
+  # a combined login can go on to start the second provider. docker run
+  # forwards the terminal's signals to the container, so Ctrl-C still lands
+  # where it did.
+  local rc=0
+  "${run[@]}" || rc=$?
+  secrets_drop
   if [ "${RALPH_ENTRY:-agent}" = "loop" ]; then
-    local rc=0
-    "${run[@]}" || rc=$?
     loop_notify "$rc"
-    exit "$rc"
   elif [ "${RALPH_RETURN_AFTER_RUN:-0}" = "1" ]; then
-    "${run[@]}"
-    return
+    return "$rc"
   fi
-  exec "${run[@]}"
+  exit "$rc"
 }
 
 cmd_shell() { RALPH_ENTRY=shell cmd_run "$@"; }
@@ -1059,6 +1106,19 @@ cmd_model() {
   esac
 }
 
+# The release number lives in VERSION; a git checkout adds what `git describe`
+# knows on top, so a bug report can name the exact commit.
+cmd_version() {
+  local v="unknown" g
+  [ -f "$RALPH_ROOT/VERSION" ] && v="$(tr -d '[:space:]' < "$RALPH_ROOT/VERSION")"
+  g="$(git -C "$RALPH_ROOT" describe --tags --always --dirty 2>/dev/null || true)"
+  if [ -n "$g" ] && [ "$g" != "v$v" ]; then
+    printf 'ralph %s (%s)\n' "$v" "$g"
+  else
+    printf 'ralph %s\n' "$v"
+  fi
+}
+
 cmd_help() {
   cat <<'__HELP__'
 ralph -- run a coding agent in yolo mode inside a locked-down container.
@@ -1073,6 +1133,7 @@ COMMANDS
   ralph status            Show mode, network policy, images and volumes
   ralph build [docker..]  Build the sandbox and proxy images
   ralph update            Rebuild from scratch with the latest agents
+  ralph version           Release number and, from a checkout, the commit
 
   ralph policy ls         Show the egress allowlist
   ralph policy edit       Edit it, then restart the proxy
@@ -1171,6 +1232,7 @@ case "${1:-run}" in
   apply)    shift; cmd_apply "$@" ;;
   clean)    shift; cmd_clean "$@" ;;
   help|-h|--help) cmd_help ;;
+  version|-v|--version) cmd_version ;;
   *)        take_provider_flag "$@"
             cmd_run ${RALPH_ARGV[@]+"${RALPH_ARGV[@]}"} ;;
 esac
