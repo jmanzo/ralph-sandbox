@@ -543,10 +543,9 @@ ralph build \
 
 | Build arg | Default |
 | --- | --- |
-| `UBUNTU_VERSION` | `24.04` |
 | `NODE_MAJOR` | `22` |
 | `EXTRA_APT_PACKAGES` / `EXTRA_NPM_PACKAGES` | -- |
-| `CLAUDE_VERSION` | `latest` (pin for reproducible images) |
+| `CLAUDE_VERSION` / `CODEX_VERSION` | pinned in the `Dockerfile`; `ralph update` builds with `latest` |
 | `SANDBOX_UID` / `SANDBOX_GID` | `1000` (match your host user on Linux) |
 
 If you add a package source, remember to allowlist its host.
