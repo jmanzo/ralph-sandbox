@@ -46,8 +46,8 @@ configuration, without the operator having turned a guardrail off:
 
 ## What is out of scope
 
-The README's *Known limits* section is the list of things `ralph` does not
-claim. In particular:
+`docs/security.md` is the threat model, and its *Known limits* section is
+the list of things `ralph` does not claim. In particular:
 
 - Kernel exploits. A container shares the host kernel; the README says so.
 - Anything that needs `sudo` inside the sandbox when `RALPH_HARDEN=off`. The

@@ -15,7 +15,7 @@ have in mind; before a change to the security boundary, always.
 | A new provider, a new notification channel | There are issues for these; comment there |
 | Reformatting, restructuring, "cleanup" | Please don't, unless an issue asked for it |
 
-The README's *Known limits* section is deliberate. A PR that quietly closes one
+The *Known limits* section of `docs/security.md` is deliberate. A PR that quietly closes one
 of those gaps is welcome; one that quietly opens a new one is not, however
 convenient the feature.
 
