@@ -1,5 +1,8 @@
 # ralph-sandbox
 
+[![ci](https://github.com/jmanzo/ralph-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/jmanzo/ralph-sandbox/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Run a coding agent in autonomous ("yolo") mode inside a locked-down container:
 deny-by-default network egress, no host filesystem beyond one workspace, and no
 access to your Docker daemon.
@@ -12,6 +15,13 @@ anywhere. `ralph` puts the agent somewhere it can only reach what you gave it.
 
 It is a Dockerfile, a proxy config, and two shell scripts. No daemon, no service,
 nothing to trust that you can't read in ten minutes.
+
+**Status: early, and used daily.** There is no tagged release yet; `ralph
+version` tells you which commit you are on. CI builds and tests the boundary
+on Linux amd64 and arm64. macOS (Apple Silicon, Docker Desktop and OrbStack)
+is where it is developed and run; Windows and WSL are untested. Pinned agent
+versions are in the `Dockerfile`; `ralph update` fetches newer ones. Read
+[docs/security.md](docs/security.md) before you rely on it.
 
 On top of that boundary it runs [Ralph](https://www.aihero.dev/getting-started-with-ralph):
 the same prompt, at the same agent, over and over, one task per iteration, until
