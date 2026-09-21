@@ -11,6 +11,17 @@ SOURCE_DIR=/run/sandbox/source
 # create them here, on every start, where an upgraded install is covered too.
 mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}" 2>/dev/null || true
 
+# API keys arrive in a file the host mounted read-only, never as `docker run
+# -e` values, so they are not in the container config for `docker inspect`
+# to print. Export them here and the agent finds them in its environment as
+# usual.
+if [ -r /run/ralph/secrets.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . /run/ralph/secrets.env
+  set +a
+fi
+
 # Clone mode: the host workspace is mounted read-only at $SOURCE_DIR and the
 # agent works in a private copy at /workspace. Seed it once, then leave it
 # alone so the agent's work survives restarts.

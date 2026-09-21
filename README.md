@@ -560,6 +560,9 @@ Worth reading before you rely on this.
 - **Credentials live inside the sandbox.** Docker's proxy injects API keys so they
   never enter the VM. Doing that requires intercepting TLS, which `ralph`
   deliberately does not do, so the agent's token is in the home volume with it.
+  An `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` from the host goes in through a
+  file mounted read-only rather than `docker run -e`, so at least it is not
+  in the container config for `docker inspect` to print.
 - **`direct` mode edits your real files.** That is the point of the mode; snapshots
   are the mitigation. Note that live edits can also trigger things outside the
   sandbox -- git hooks, IDE file watchers, `make` targets running on your host.
