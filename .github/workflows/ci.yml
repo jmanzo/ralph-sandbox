@@ -355,6 +355,18 @@ jobs:
             && { echo "raw-IP egress succeeded, policy is broken"; exit 1; } \
             || echo "raw-IP egress blocked"
 
+      - name: The proxy serves the sandbox network only
+        run: |
+          # The proxy is attached to the egress bridge as well. A container
+          # that lands on that bridge must not get an allowlisted route out
+          # through it.
+          code=$(docker run --rm --network ralph-egress \
+                   -e https_proxy=http://ralph-proxy:8888 ralph-sandbox \
+                   curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.anthropic.com || true)
+          echo "from egress bridge: $code"
+          test "$code" != 404
+          docker logs ralph-proxy 2>&1 | grep -q "Unauthorized connection"
+
       - name: Git works in the sandbox even with a host gitconfig mounted
         run: |
           # A mounted ~/.gitconfig must not shadow the safe.directory rules, or
