@@ -207,6 +207,32 @@ ws_volume_name() {
   esac
 }
 
+# API keys go into the sandbox through a file mounted read-only, not through
+# `docker run -e`. An environment variable is recorded in the container's
+# config, where `docker inspect` shows it to anyone who can talk to the
+# daemon; a file with mode 600 in the user's own data directory is not. The
+# entrypoint sources it before handing off, so the agent still finds the key
+# where it expects to.
+RALPH_SECRETS_FILE=""
+secrets_write() {
+  [ -n "${ANTHROPIC_API_KEY:-}${OPENAI_API_KEY:-}" ] || return 0
+  local dir="$_data_home/run"
+  mkdir -p "$dir" && chmod 700 "$dir"
+  RALPH_SECRETS_FILE="$(mktemp "$dir/secrets.XXXXXX")"
+  chmod 600 "$RALPH_SECRETS_FILE"
+  # %q quotes for bash, which is what sources the file in the entrypoint.
+  {
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then printf 'ANTHROPIC_API_KEY=%q\n' "$ANTHROPIC_API_KEY"; fi
+    if [ -n "${OPENAI_API_KEY:-}" ];    then printf 'OPENAI_API_KEY=%q\n'    "$OPENAI_API_KEY"; fi
+  } > "$RALPH_SECRETS_FILE"
+  trap secrets_drop EXIT
+}
+secrets_drop() {
+  [ -n "$RALPH_SECRETS_FILE" ] && rm -f "$RALPH_SECRETS_FILE"
+  RALPH_SECRETS_FILE=""
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Egress policy
 # ---------------------------------------------------------------------------
@@ -581,15 +607,16 @@ cmd_run() {
   local extra=()
   [ -n "$RALPH_DOCKER_ARGS" ] && read -r -a extra <<<"$RALPH_DOCKER_ARGS"
 
+  secrets_write
+  [ -n "$RALPH_SECRETS_FILE" ] && args+=(-v "$RALPH_SECRETS_FILE:/run/ralph/secrets.env:ro")
+
   # Note: the host Docker socket is deliberately never mounted.
   local run=(docker run --rm "${tty[@]}"
     --hostname ralph
     "${args[@]}"
     -w /workspace
     -e TERM="${TERM:-xterm-256color}"
-    -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
     -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}"
-    -e OPENAI_API_KEY="${OPENAI_API_KEY:-}"
     -e RALPH_AGENT_CMD="$RALPH_AGENT_CMD"
     -e RALPH_PROJECT="$RALPH_WORKSPACE"
     -e RALPH_MODEL_ORCHESTRATOR="$RALPH_MODEL_ORCHESTRATOR"
@@ -607,19 +634,20 @@ cmd_run() {
     ${extra[@]+"${extra[@]}"}
     "$RALPH_IMAGE" "${entry[@]}" "$@")
 
-  # The loop is wrapped rather than exec'd, so the host survives the container
-  # and can post the alert the sandbox left behind. Combined login also has to
-  # return so it can start the second provider.
+  # The container is a child rather than an exec, so the host survives it:
+  # to remove the secrets file, to post the alert a loop left behind, and so
+  # a combined login can go on to start the second provider. docker run
+  # forwards the terminal's signals to the container, so Ctrl-C still lands
+  # where it did.
+  local rc=0
+  "${run[@]}" || rc=$?
+  secrets_drop
   if [ "${RALPH_ENTRY:-agent}" = "loop" ]; then
-    local rc=0
-    "${run[@]}" || rc=$?
     loop_notify "$rc"
-    exit "$rc"
   elif [ "${RALPH_RETURN_AFTER_RUN:-0}" = "1" ]; then
-    "${run[@]}"
-    return
+    return "$rc"
   fi
-  exec "${run[@]}"
+  exit "$rc"
 }
 
 cmd_shell() { RALPH_ENTRY=shell cmd_run "$@"; }
