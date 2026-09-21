@@ -604,8 +604,14 @@ cmd_run() {
   local tty=(-i)
   [ -t 0 ] && [ -t 1 ] && tty=(-it)
 
+  # Split like a shell would, so a quoted value survives:
+  #   RALPH_DOCKER_ARGS="-e FOO='a b' --label x=y"
+  # read -a splits on whitespace and would hand docker three broken words.
+  # config.env is already sourced, so evaluating a value from it adds no trust
+  # that was not already given.
   local extra=()
-  [ -n "$RALPH_DOCKER_ARGS" ] && read -r -a extra <<<"$RALPH_DOCKER_ARGS"
+  # shellcheck disable=SC2294
+  [ -n "$RALPH_DOCKER_ARGS" ] && eval "extra=($RALPH_DOCKER_ARGS)"
 
   secrets_write
   [ -n "$RALPH_SECRETS_FILE" ] && args+=(-v "$RALPH_SECRETS_FILE:/run/ralph/secrets.env:ro")
