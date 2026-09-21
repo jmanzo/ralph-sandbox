@@ -1,0 +1,37 @@
+name: Feature request
+description: Something ralph should do that it does not.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a look at the open issues first; many of the obvious next steps already have one, and a comment there beats a duplicate.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened that made you want this
+      description: A real situation, not a best practice. "The run handed over to codex at 3am because of a transient 429" is a reason; "it would be more robust" is not yet one.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like ralph to do
+      description: The behaviour, as the README would describe it. If it needs a new `RALPH_*` variable or subcommand, name it.
+    validations:
+      required: true
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Does it change what the sandbox can reach?
+      description: A new mount, a new host on the default allowlist, a new environment variable entering the container, a new network.
+      options:
+        - "No"
+        - "Yes, and here is why it is worth it"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead
