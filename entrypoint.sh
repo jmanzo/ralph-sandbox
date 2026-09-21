@@ -20,6 +20,11 @@ if [ -r /run/ralph/secrets.env ]; then
   # shellcheck disable=SC1091
   . /run/ralph/secrets.env
   set +a
+elif [ -e /run/ralph/secrets.env ]; then
+  # Mounted but unreadable: a Linux host whose uid the image was not built
+  # with. Say so, or the agent fails on its first call with no explanation.
+  echo "==> /run/ralph/secrets.env is not readable by $(id -u); API keys from the host will be missing" >&2
+  echo "==> rebuild with: ralph build --build-arg SANDBOX_UID=\$(id -u) --build-arg SANDBOX_GID=\$(id -g)" >&2
 fi
 
 # Clone mode: the host workspace is mounted read-only at $SOURCE_DIR and the
