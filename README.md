@@ -409,6 +409,8 @@ could go. Entries are extended regexes matched against the hostname; anchor them
 with `^...$` so a rule for `github.com` can't be satisfied by
 `github.com.attacker.example`.
 
+To eliminate retry noise and connection delays from blocked telemetry endpoints, the sandbox image bakes in telemetry-off environment variables (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`, and `DO_NOT_TRACK=1`) and seeds `[telemetry] disabled = true` in Codex's `config.toml`. Any of these can be overridden via `RALPH_DOCKER_ARGS` if needed.
+
 To disable the policy entirely (the sandbox then has open internet):
 
 ```bash

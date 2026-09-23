@@ -10,6 +10,10 @@ SOURCE_DIR=/run/sandbox/source
 # image when it is empty -- and codex refuses to start without CODEX_HOME. So
 # create them here, on every start, where an upgraded install is covered too.
 mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}" 2>/dev/null || true
+if [ ! -f "${CODEX_HOME:-$HOME/.codex}/config.toml" ]; then
+  printf '[telemetry]\ndisabled = true\n' > "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null || true
+fi
+
 
 # Clone mode: the host workspace is mounted read-only at $SOURCE_DIR and the
 # agent works in a private copy at /workspace. Seed it once, then leave it

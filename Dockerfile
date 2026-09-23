@@ -72,10 +72,14 @@ ENV HOME=/home/sandboxuser \
     CLAUDE_CONFIG_DIR=/home/sandboxuser/.claude \
     CODEX_HOME=/home/sandboxuser/.codex \
     DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    ENABLE_CLAUDEAI_MCP_SERVERS=false \
+    DO_NOT_TRACK=1 \
     npm_config_prefix=/home/sandboxuser/.npm-global \
     PATH=/home/sandboxuser/.npm-global/bin:/home/sandboxuser/.local/bin:$PATH
 
-RUN mkdir -p /home/sandboxuser/.claude /home/sandboxuser/.codex /home/sandboxuser/.npm-global
+RUN mkdir -p /home/sandboxuser/.claude /home/sandboxuser/.codex /home/sandboxuser/.npm-global \
+    && printf '[telemetry]\ndisabled = true\n' > /home/sandboxuser/.codex/config.toml
 
 COPY --chown=sandboxuser:sandboxuser entrypoint.sh /usr/local/bin/ralph-entrypoint
 # The Ralph loop driver. `ralph loop` runs this instead of handing the agent
