@@ -20,14 +20,16 @@
 
 # --- Optional Claude Code hosts (uncomment only if you need them) ---
 # claude.ai MCP connectors, which are on by default for claude.ai logins.
-# Leave blocked and set ENABLE_CLAUDEAI_MCP_SERVERS=false to avoid the retries.
+# Leave blocked and set ENABLE_CLAUDEAI_MCP_SERVERS=false to avoid the retries
+# (set by default in the sandbox image).
 #^mcp-proxy\.anthropic\.com$
 # Plugin downloads, native installer and auto-update checks.
 #^downloads\.claude\.ai$
 # Docs lookups by the built-in claude-code-guide agent.
 #^code\.claude\.com$
 # Operational telemetry and error reports. Blocked here by design; also set
-# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 so nothing waits on them.
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 so nothing waits on them
+# (set by default in the sandbox image).
 #^http-intake\.logs\.us5\.datadoghq\.com$
 #^browser-intake-us5-datadoghq\.com$
 
@@ -40,7 +42,8 @@
 ^chatgpt\.com$
 ^api\.openai\.com$
 
-# Codex telemetry. Blocked by design, like its Anthropic counterpart.
+# Codex telemetry. Blocked by design, like its Anthropic counterpart
+# (disabled in ~/.codex/config.toml by default in the sandbox image).
 #^ab\.chatgpt\.com$
 
 # --- Package registries ---
