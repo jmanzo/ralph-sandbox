@@ -5,3 +5,5 @@ LICENSE
 .gitignore
 .DS_Store
 templates
+.cursor
+docs

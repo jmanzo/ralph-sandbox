@@ -1,0 +1,19 @@
+---
+description: Conventions for the ralph-sandbox repository. Always on.
+alwaysApply: true
+---
+
+Follow the instructions in @AGENTS.md. It is the single source of truth for
+this repository, shared with Claude Code, Codex and Copilot; do not add rules
+here, add them there.
+
+The parts that bite most often:
+
+- The sandbox boundary is the product. Nothing new enters the container
+  (mounts, environment variables, networks, allowlist hosts) without README
+  text and a CI test.
+- Host scripts (`ralph`, `install.sh`) must run on bash 3.2. ASCII only.
+  shellcheck warning-free. `set -euo pipefail` stays.
+- Comments say why, not what. Match the voice of `loop.sh` and the README.
+- Conventional Commits, one change per commit. Never rewrite history.
+- Leave `templates/` alone unless the task is about them.

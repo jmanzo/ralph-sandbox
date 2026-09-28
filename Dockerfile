@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
-ARG UBUNTU_VERSION=24.04
-FROM ubuntu:${UBUNTU_VERSION}
+# Pinned by digest: a tag is whatever the registry says it is today, a digest
+# is one specific image. Dependabot moves it. Written out in full rather than
+# through a build arg because that is the only form Dependabot can read.
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
 
 LABEL org.opencontainers.image.title="ralph-sandbox" \
       org.opencontainers.image.description="Disposable container for running coding agents in autonomous (yolo) mode" \
@@ -12,9 +14,11 @@ ARG NODE_MAJOR=22
 #   docker build --build-arg EXTRA_APT_PACKAGES="golang-go postgresql-client"
 ARG EXTRA_APT_PACKAGES=""
 ARG EXTRA_NPM_PACKAGES=""
-# Pin the agents for reproducible images, e.g. CLAUDE_VERSION=2.1.197
-ARG CLAUDE_VERSION=latest
-ARG CODEX_VERSION=latest
+# The agents are pinned so `ralph build` is reproducible and a release of
+# either CLI cannot change the sandbox under an unattended run. `ralph update`
+# passes `latest` for both; pass a version yourself to land anywhere else.
+ARG CLAUDE_VERSION=2.1.278
+ARG CODEX_VERSION=0.155.1
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -26,9 +30,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js. NodeSource publishes native amd64 and arm64 builds, so this image
-# builds and runs on Apple Silicon and x86 alike with no emulation.
-RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+# builds and runs on Apple Silicon and x86 alike with no emulation. Their
+# setup script is not piped into bash: it does nothing more than the three
+# lines below, and a script fetched at build time and run as root is the one
+# place a supply-chain change would be invisible in a diff of this file.
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+       > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 RUN if [ -n "$EXTRA_APT_PACKAGES" ]; then \
