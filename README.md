@@ -12,6 +12,8 @@ Run a coding agent in autonomous ("yolo") mode inside a locked-down container:
 deny-by-default network egress, no host filesystem beyond one workspace, and no
 access to your Docker daemon.
 
+![ralph status, a blocked and an allowed host, curl failing inside the sandbox, then ralph loop finishing a two-task PRD](docs/demo.gif)
+
 Agents are most useful when they aren't stopping to ask about every file write and
 shell command. But `--dangerously-skip-permissions` means exactly what it says. On
 your host, one bad command is your dotfiles, your SSH keys, or your other
