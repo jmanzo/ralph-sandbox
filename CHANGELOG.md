@@ -7,7 +7,9 @@ version` prints the release you are running.
 
 ## [Unreleased]
 
-Everything below is what will become the first tagged release.
+## [0.1.0] - 2026-10-01
+
+The first tagged release.
 
 ### Added
 
@@ -48,6 +50,7 @@ Everything below is what will become the first tagged release.
 - The NodeSource setup script is no longer piped into bash at build time;
   the keyring and apt source are written out in the `Dockerfile`.
 - The README is a quick start; the reference material moved to `docs/`.
+- The sandbox image is built on Ubuntu 26.04 and the proxy on Alpine 3.24.
 
 ### Fixed
 
@@ -64,4 +67,5 @@ Everything below is what will become the first tagged release.
 - GitHub Actions are pinned by commit SHA and the workflow token is
   read-only.
 
-[Unreleased]: https://github.com/jmanzo/ralph-sandbox/commits/main
+[Unreleased]: https://github.com/jmanzo/ralph-sandbox/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jmanzo/ralph-sandbox/releases/tag/v0.1.0
