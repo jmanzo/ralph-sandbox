@@ -2,7 +2,7 @@
 # Pinned by digest: a tag is whatever the registry says it is today, a digest
 # is one specific image. Dependabot moves it. Written out in full rather than
 # through a build arg because that is the only form Dependabot can read.
-FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
+FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
 
 LABEL org.opencontainers.image.title="ralph-sandbox" \
       org.opencontainers.image.description="Disposable container for running coding agents in autonomous (yolo) mode" \
