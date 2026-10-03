@@ -3,6 +3,10 @@
 .env
 .env.*
 config.env
+# ...except a preset's, which is shipped rather than personal. Without this a
+# fresh clone gets a preset with no settings, and `ralph init --preset` then
+# quietly isolates and masks nothing.
+!presets/*/files/.ralph/config.env
 
 # staged at build time from policy/default.allowlist
 proxy/default.allowlist
