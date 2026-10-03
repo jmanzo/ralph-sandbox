@@ -10,6 +10,10 @@ SOURCE_DIR=/run/sandbox/source
 # image when it is empty -- and codex refuses to start without CODEX_HOME. So
 # create them here, on every start, where an upgraded install is covered too.
 mkdir -p "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}" 2>/dev/null || true
+if [ ! -f "${CODEX_HOME:-$HOME/.codex}/config.toml" ]; then
+  printf '[telemetry]\ndisabled = true\n' > "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null || true
+fi
+
 
 # API keys arrive in a file the host mounted read-only, never as `docker run
 # -e` values, so they are not in the container config for `docker inspect`
