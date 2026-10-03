@@ -7,6 +7,16 @@ version` prints the release you are running.
 
 ## [Unreleased]
 
+### Added
+
+- A project can carry its own ralph settings in `.ralph/config.env`, committed
+  alongside the code, so a checkout runs the same way on every machine. Only
+  the convenience settings may come from there; the egress policy, the
+  workspace mode, the image, docker arguments and the spend ceiling stay with
+  the person running `ralph`. The file is parsed rather than sourced, and in
+  `direct` mode it is mounted back read-only so the agent cannot rewrite the
+  settings it runs under.
+
 ## [0.1.0] - 2026-10-01
 
 The first tagged release.

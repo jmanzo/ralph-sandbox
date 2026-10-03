@@ -20,18 +20,95 @@ done
 RALPH_ROOT="$(cd -P "$(dirname "$_self")" && pwd)"
 
 # ---------------------------------------------------------------------------
+# Messages. Up here because reading the config can already have something to
+# say about it.
+# ---------------------------------------------------------------------------
+die()  { printf 'ralph: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[2m==> %s\033[0m\n' "$*" >&2; }
+warn() { printf '\033[33mralph: %s\033[0m\n' "$*" >&2; }
+
+# ---------------------------------------------------------------------------
 # Config. Every value is overridable by env var, or in the config file.
 # ---------------------------------------------------------------------------
 _cfg_home="${XDG_CONFIG_HOME:-$HOME/.config}/ralph"
 _data_home="${XDG_DATA_HOME:-$HOME/.local/share}/ralph"
 RALPH_CONFIG="${RALPH_CONFIG:-$_cfg_home/config.env}"
+
+# What a project may set for itself in .ralph/config.env, so a checkout
+# carries the settings it needs to run rather than every machine keeping its
+# own copy. Convenience only. The egress policy, the workspace mode, the
+# image, docker arguments, the spend ceiling and what of your home directory
+# gets mounted are all absent from this list on purpose: a repository you have
+# only just cloned must not be able to loosen the sandbox it is about to run
+# inside.
+RALPH_PROJECT_SETTABLE="RALPH_ISOLATE RALPH_MASK RALPH_BUILD_ARGS"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_MAX RALPH_LOOP_SLEEP"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_STALL RALPH_LOOP_FAILS"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_REPEAT RALPH_FALLBACK"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_MODEL_ORCHESTRATOR"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_CODEX_MODEL RALPH_CODEX_EFFORT"
+
+# A value typed on the command line outranks both config files, so note which
+# of these names the environment already carried before either one is read.
+_env_given=""
+for _n in $RALPH_PROJECT_SETTABLE; do
+  eval "[ -n \"\${$_n+1}\" ]" && _env_given="$_env_given $_n"
+done
+
 # shellcheck disable=SC1090
 [ -f "$RALPH_CONFIG" ] && . "$RALPH_CONFIG"
+
+# A project's settings live in its workspace, so that has to be settled first.
+RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
+RALPH_PROJECT_CONFIG=""
+
+# .ralph/config.env is PARSED, never sourced. It sits in the workspace, which
+# in direct mode is a tree the agent itself can write, and sourcing it would
+# run that tree's shell code on the host as you. Every line is NAME=value;
+# any other line, any name outside RALPH_PROJECT_SETTABLE and any value that
+# could carry a command is named in a warning and skipped.
+load_project_settings() {
+  local file="$RALPH_WORKSPACE/.ralph/config.env" line name value
+  [ -f "$file" ] || return 0
+  RALPH_PROJECT_CONFIG="$file"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in
+      *=*) name="${line%%=*}"; value="${line#*=}" ;;
+      *)   warn "$file: not NAME=value, ignoring: $line"; continue ;;
+    esac
+    # Trailing blanks, and the stray CR a Windows editor leaves behind.
+    name="${name%"${name##*[![:space:]]}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    # One layer of quotes, the way a shell would take it off.
+    case "$value" in
+      \"*\") value="${value#\"}"; value="${value%\"}" ;;
+      \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    case " $RALPH_PROJECT_SETTABLE " in
+      *" $name "*) : ;;
+      *) warn "$file: $name is not a project setting -- ignored"; continue ;;
+    esac
+    # RALPH_BUILD_ARGS reaches an eval and the path lists reach docker, and
+    # this file is the one input that arrives with somebody else's repository.
+    # A value that could run something is refused outright rather than quoted
+    # and hoped about.
+    case "$value" in
+      *'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*\\*)
+        warn "$file: $name contains shell metacharacters -- ignored"; continue ;;
+    esac
+    case " $_env_given " in
+      *" $name "*) continue ;;
+    esac
+    eval "$name=\$value"
+  done < "$file"
+}
+load_project_settings
 
 RALPH_IMAGE="${RALPH_IMAGE:-ralph-sandbox}"
 RALPH_PROXY_IMAGE="${RALPH_PROXY_IMAGE:-ralph-proxy}"
 RALPH_HOME_VOLUME="${RALPH_HOME_VOLUME:-ralph-home}"
-RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
 RALPH_AGENT_CMD_SET="${RALPH_AGENT_CMD+1}"
 RALPH_AGENT_CMD="${RALPH_AGENT_CMD:-claude --dangerously-skip-permissions}"
 
@@ -115,10 +192,6 @@ RALPH_HARDEN="${RALPH_HARDEN:-off}"
 RALPH_MOUNT_GITCONFIG="${RALPH_MOUNT_GITCONFIG:-1}"
 RALPH_MOUNT_SSH="${RALPH_MOUNT_SSH:-0}"
 RALPH_DOCKER_ARGS="${RALPH_DOCKER_ARGS:-}"
-
-die()  { printf 'ralph: %s\n' "$*" >&2; exit 1; }
-info() { printf '\033[2m==> %s\033[0m\n' "$*" >&2; }
-warn() { printf '\033[33mralph: %s\033[0m\n' "$*" >&2; }
 
 command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
 
@@ -556,6 +629,12 @@ cmd_run() {
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
       snapshot_create quiet
       args+=(-v "$RALPH_WORKSPACE:/workspace")
+      # The settings the host just read, mounted back over themselves
+      # read-only. Without this the agent could rewrite its own
+      # .ralph/config.env and the next run would start with whatever it chose
+      # -- nothing masked, no dependency directory of its own.
+      [ -n "$RALPH_PROJECT_CONFIG" ] &&
+        args+=(-v "$RALPH_PROJECT_CONFIG:/workspace/.ralph/config.env:ro")
       ;;
     clone)
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
@@ -827,6 +906,9 @@ cmd_status() {
   printf 'hardened      %s\n' "$RALPH_HARDEN"
   printf 'snapshots     %s  (%s)\n' "$RALPH_SNAPSHOT" "$(snapshot_store)"
   printf 'config        %s%s\n' "$RALPH_CONFIG" "$([ -f "$RALPH_CONFIG" ] || echo '  (none)')"
+  if [ -n "$RALPH_PROJECT_CONFIG" ]; then
+    printf 'project cfg   %s\n' "$RALPH_PROJECT_CONFIG"
+  fi
   if image_exists "$RALPH_IMAGE"; then
     printf 'image         %s  %s\n' "$RALPH_IMAGE" \
       "$(docker image inspect "$RALPH_IMAGE" --format '{{.Architecture}}' 2>/dev/null)"
@@ -1208,6 +1290,10 @@ KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_NOTIFY_ON         always | problem             [always]
   RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
   RALPH_MOUNT_GITCONFIG   [1]      RALPH_MOUNT_SSH     [0]
+
+  A project can carry its own settings in .ralph/config.env, which travels
+  with the repository. Only the convenience settings may come from there --
+  never the egress policy, the workspace mode or docker arguments.
 
 Run `ralph status` to see what is actually in effect.
 __HELP__

@@ -1,8 +1,10 @@
 # Configuration
 
 Every setting is an environment variable, and every one can live in
-`~/.config/ralph/config.env` instead, which `ralph` sources first. `ralph
-status` shows what is in effect. The loop's own variables are explained in
+`~/.config/ralph/config.env` instead, which `ralph` sources first. A project
+can also carry a few of them itself, in `.ralph/config.env` -- see [settings
+that live in the project](#settings-that-live-in-the-project). `ralph status`
+shows what is in effect. The loop's own variables are explained in
 [loop.md](loop.md); the boundary they apply to is in [security.md](security.md).
 
 | Variable | Default | What it does |
@@ -59,6 +61,43 @@ Every project shares one login volume by default. To fully quarantine one:
 ```sh
 RALPH_HOME_VOLUME=ralph-home-clientwork ralph
 ```
+
+### Settings that live in the project
+
+Some settings belong to the repository rather than to the machine: which
+dependency directories the sandbox keeps its own copy of, which files the
+agent must not read, what the image needs installed to build the project at
+all. Put those in `.ralph/config.env` in the project and commit it, and every
+checkout on every machine runs the same way:
+
+```sh
+# myapp/.ralph/config.env
+RALPH_ISOLATE="node_modules"
+RALPH_MASK=".env"
+RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=pnpm"
+```
+
+Precedence is what you would expect: a value typed on the command line beats
+the project file, which beats `~/.config/ralph/config.env`, which beats the
+built-in default.
+
+**A project may only set these:**
+
+`RALPH_ISOLATE`, `RALPH_MASK`, `RALPH_BUILD_ARGS`, `RALPH_LOOP_MAX`,
+`RALPH_LOOP_SLEEP`, `RALPH_LOOP_STALL`, `RALPH_LOOP_FAILS`,
+`RALPH_LOOP_REPEAT`, `RALPH_FALLBACK`, `RALPH_MODEL_ORCHESTRATOR`,
+`RALPH_CODEX_MODEL`, `RALPH_CODEX_EFFORT`.
+
+Anything else in the file is named in a warning and ignored. The egress
+policy, the workspace mode, the image, `RALPH_DOCKER_ARGS`, the spend ceiling
+and what of your home directory gets mounted are absent on purpose: cloning a
+repository and running `ralph` in it must not be a way to loosen the sandbox,
+or to spend your money. For the same reason the file is parsed rather than
+sourced, and a value containing shell metacharacters is refused instead of
+quoted and hoped about.
+
+In `direct` mode `ralph` mounts the file back over itself read-only, so the
+agent cannot change the settings its next run will start with.
 
 ## Customizing the image
 
