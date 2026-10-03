@@ -479,6 +479,18 @@ proxy_down() {
 # that is already there: the allowlist belongs to the user, and a merge that
 # reorders or drops their own lines would be a worse trade than a stale one.
 # Shared by `policy sync` and by a preset's extra hosts.
+# A running proxy reads the allowlist at startup, so a change needs a restart;
+# a proxy that is not running needs nothing. Written as a function with an
+# explicit exit status because this is the last thing each policy command
+# does: as a trailing `proxy_running && ...` it made `ralph policy sync` and
+# `ralph policy reset` exit 1 on any machine where the proxy happened to be
+# down, which is most of them.
+policy_reload() {
+  proxy_running || return 0
+  info "restarting proxy to apply policy"
+  docker restart "$RALPH_PROXY_NAME" >/dev/null
+}
+
 policy_merge() {
   local src="$1" label="$2" nothing="$3" added=0 rule
   ensure_allowlist
@@ -496,7 +508,7 @@ policy_merge() {
     info "$nothing"
   else
     info "$added rule(s) added to $RALPH_ALLOWLIST"
-    proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
+    policy_reload
   fi
 }
 
@@ -511,13 +523,13 @@ cmd_policy() {
     edit)
       ensure_allowlist
       "${EDITOR:-vi}" "$RALPH_ALLOWLIST"
-      proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
+      policy_reload
       ;;
     reset)
       mkdir -p "$(dirname "$RALPH_ALLOWLIST")"
       cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ALLOWLIST"
       info "policy reset to defaults"
-      proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
+      policy_reload
       ;;
     sync)
       # An allowlist is seeded once and then belongs to the user, so shipping a
