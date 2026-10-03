@@ -9,6 +9,15 @@ version` prints the release you are running.
 
 ### Added
 
+- `ralph init --preset NAME`: a stack's setup in one command -- the rules
+  every agent in the loop reads, the project's build and test commands read
+  out of `package.json`, the settings the sandbox needs, a PRD skeleton, and
+  the hosts the stack reaches at build time merged into the egress policy. A
+  preset can only ask for what a project may set, so it cannot widen the
+  sandbox.
+- A `shopify` preset, for embedded admin apps on Remix or React Router with
+  Prisma and Postgres: offline migrations, shop scoping, webhooks, the Admin
+  API, billing, extensions and Functions.
 - `RALPH_BUILD_ARGS`: `docker build` arguments remembered in a config file, so
   `ralph update` keeps the toolchain `ralph build` was given instead of
   silently dropping it.

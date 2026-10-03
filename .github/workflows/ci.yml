@@ -84,6 +84,54 @@ jobs:
           grep -qE 'CLAUDE_VERSION=latest .*CLAUDE_VERSION=2\.1\.278' /tmp/docker-calls
           git diff --exit-code proxy/default.allowlist
 
+      - name: A preset lays down a stack's rules, settings and hosts
+        run: |
+          export XDG_CONFIG_HOME=/tmp/cfg
+          rm -rf /tmp/cfg /tmp/app && mkdir -p /tmp/cfg /tmp/app/extensions/cart
+          cat > /tmp/app/package.json <<'JSON'
+          {
+            "packageManager": "pnpm@9.15.9",
+            "scripts": {
+              "build": "remix vite:build",
+              "typecheck": "tsc --noEmit",
+              "test:run": "vitest run",
+              "lint": "eslint ."
+            },
+            "devDependencies": { "lint": "1.0.0" }
+          }
+          JSON
+          touch /tmp/app/pnpm-lock.yaml
+          RALPH_WORKSPACE=/tmp/app ./ralph init --preset shopify
+
+          # The rules, with both entry points pointing at the one copy.
+          test -f /tmp/app/.ralph/rules.md
+          grep -q '@.ralph/rules.md' /tmp/app/CLAUDE.md
+          grep -q '.ralph/rules.md' /tmp/app/AGENTS.md
+          # The preset's PRD skeleton won over the generic template's.
+          grep -q 'Shopify app' /tmp/app/PRD.md
+          # Commands out of package.json; package manager out of the lockfile.
+          grep -q 'pnpm install --frozen-lockfile' /tmp/app/CLAUDE.md
+          grep -q 'pnpm run test:run' /tmp/app/CLAUDE.md
+          ! grep -q '# fill in' /tmp/app/CLAUDE.md
+          grep -q 'EXTRA_NPM_PACKAGES=pnpm@9.15.9' /tmp/app/.ralph/config.env
+          # A dependency named like a script is not a script.
+          ! grep -q 'pnpm run lint' /tmp/app/CLAUDE.md
+          # The stack's hosts, in the user's own policy.
+          grep -q 'binaries' /tmp/cfg/ralph/allowlist
+          # A preset cannot ask for anything a project may not set.
+          grep -q RALPH_ISOLATE /tmp/app/.ralph/config.env
+          ! grep -qE '^RALPH_(DOCKER_ARGS|NETWORK_POLICY|MODE|IMAGE|HARDEN|MOUNT_SSH)=' \
+              /tmp/app/.ralph/config.env
+
+          # Twice is the same as once.
+          out=$(RALPH_WORKSPACE=/tmp/app ./ralph init --preset shopify 2>&1)
+          echo "$out"
+          echo "$out" | grep -q '0 file(s) created'
+          test "$(grep -c '## Stack rules' /tmp/app/CLAUDE.md)" = 1
+          test "$(grep -c RALPH_BUILD_ARGS /tmp/app/.ralph/config.env)" = 1
+
+          ./ralph init --preset nope 2>&1 | grep -q "unknown preset"
+
   loop:
     runs-on: ubuntu-latest
     steps:

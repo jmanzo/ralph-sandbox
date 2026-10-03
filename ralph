@@ -475,6 +475,31 @@ proxy_down() {
   fi
 }
 
+# Add the rules in a file that the policy does not have yet, touching nothing
+# that is already there: the allowlist belongs to the user, and a merge that
+# reorders or drops their own lines would be a worse trade than a stale one.
+# Shared by `policy sync` and by a preset's extra hosts.
+policy_merge() {
+  local src="$1" label="$2" nothing="$3" added=0 rule
+  ensure_allowlist
+  [ -f "$src" ] || return 0
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    grep -qxF "$rule" "$RALPH_ALLOWLIST" && continue
+    [ "$added" -eq 0 ] && printf '\n# --- added by %s on %s ---\n' \
+      "$label" "$(date -u +%Y-%m-%d)" >> "$RALPH_ALLOWLIST"
+    printf '%s\n' "$rule" >> "$RALPH_ALLOWLIST"
+    info "added $rule"
+    added=$((added + 1))
+  done < <(grep -vE '^\s*(#|$)' "$src")
+  if [ "$added" -eq 0 ]; then
+    info "$nothing"
+  else
+    info "$added rule(s) added to $RALPH_ALLOWLIST"
+    proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
+  fi
+}
+
 cmd_policy() {
   case "${1:-ls}" in
     ls)
@@ -498,25 +523,9 @@ cmd_policy() {
       # An allowlist is seeded once and then belongs to the user, so shipping a
       # new default does not reach an existing install. That is usually right,
       # and exactly wrong for a host a new feature needs: the codex fallback
-      # would fail at the far end of an unattended run. This adds what is
-      # missing and touches nothing that is already there.
-      ensure_allowlist
-      local added=0 rule
-      while IFS= read -r rule; do
-        [ -n "$rule" ] || continue
-        grep -qxF "$rule" "$RALPH_ALLOWLIST" && continue
-        [ "$added" -eq 0 ] && printf '\n# --- added by ralph policy sync on %s ---\n' \
-          "$(date -u +%Y-%m-%d)" >> "$RALPH_ALLOWLIST"
-        printf '%s\n' "$rule" >> "$RALPH_ALLOWLIST"
-        info "added $rule"
-        added=$((added + 1))
-      done < <(grep -vE '^\s*(#|$)' "$RALPH_ROOT/policy/default.allowlist")
-      if [ "$added" -eq 0 ]; then
-        info "policy already has every shipped rule"
-      else
-        info "$added rule(s) added to $RALPH_ALLOWLIST"
-        proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
-      fi
+      # would fail at the far end of an unattended run.
+      policy_merge "$RALPH_ROOT/policy/default.allowlist" "ralph policy sync" \
+        "policy already has every shipped rule"
       ;;
     test)
       local host="${2:-}"
@@ -1144,37 +1153,238 @@ cmd_proxy() {
 # `init` lays down the PRD, the loop prompt, the shared state files and the
 # orchestrator's three subagents. It runs on the host, not in the sandbox, so
 # you can open PRD.md in your editor before anything starts.
-cmd_init() {
-  case "${1:-}" in
-    ''|--force) : ;;
-    *) die "unknown argument: $1 (expected --force)" ;;
-  esac
-  local force=0
-  [ "${1:-}" = "--force" ] && force=1
-
-  local src="$RALPH_ROOT/templates"
-  [ -d "$src" ] || die "templates not found at $src"
-  [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
-
-  local rel dest created=0 skipped=0
+# Copy a tree into the workspace. Anything already there is left alone unless
+# --force, because `ralph init` is run again on projects that have been worked
+# on. SKIP is a space-separated list of paths a preset has already provided,
+# which the templates must not overwrite even with --force.
+_scaffold_created=0
+_scaffold_skipped=0
+scaffold_tree() {
+  local src="$1" force="$2" skip="${3:- }" rel dest
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
+    case " $skip " in *" $rel "*) continue ;; esac
     dest="$RALPH_WORKSPACE/$rel"
     if [ -e "$dest" ] && [ "$force" -eq 0 ]; then
       printf '  skip    %s\n' "$rel"
-      skipped=$((skipped + 1))
+      _scaffold_skipped=$((_scaffold_skipped + 1))
       continue
     fi
     mkdir -p "$(dirname "$dest")"
     cp "$src/$rel" "$dest"
     printf '  create  %s\n' "$rel"
-    created=$((created + 1))
+    _scaffold_created=$((_scaffold_created + 1))
   done <<EOF
 $(cd "$src" && find . -type f | sed 's|^\./||' | sort)
 EOF
+}
 
-  info "$created file(s) created, $skipped left alone"
-  if [ "$skipped" -gt 0 ] && [ "$force" -eq 0 ]; then
+preset_names() {
+  [ -d "$RALPH_ROOT/presets" ] || return 0
+  (cd "$RALPH_ROOT/presets" \
+     && find . -maxdepth 1 -mindepth 1 -type d | sed 's|^\./||' | sort)
+}
+
+# Which package manager the project uses, decided by its lockfile rather than
+# by what is popular: installing with the wrong one is a wasted iteration, and
+# in a monorepo it is a wasted hour.
+detect_pm() {
+  if   [ -f "$RALPH_WORKSPACE/pnpm-lock.yaml" ];     then printf 'pnpm'
+  elif [ -f "$RALPH_WORKSPACE/yarn.lock" ];          then printf 'yarn'
+  elif [ -f "$RALPH_WORKSPACE/bun.lockb" ];          then printf 'bun'
+  elif [ -f "$RALPH_WORKSPACE/package-lock.json" ];  then printf 'npm'
+  else printf ''
+  fi
+}
+
+# The names in package.json's "scripts" object, one per line. Only that
+# object: a dependency called `lint` is not a script called `lint`, and
+# telling the loop to run a command that does not exist costs an iteration.
+# jq is optional on the host, hence the fallback -- it walks the braces that
+# close the object rather than trusting the file to be pretty-printed.
+pkg_scripts() {
+  local f="$RALPH_WORKSPACE/package.json"
+  [ -f "$f" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'try (.scripts | keys[]) catch empty' "$f" 2>/dev/null
+    return 0
+  fi
+  tr -d '\n' < "$f" | awk '
+    {
+      i = index($0, "\"scripts\"")
+      if (i == 0) exit
+      s = substr($0, i)
+      s = substr(s, index(s, "{") + 1)
+      depth = 1
+      body = ""
+      for (n = 1; n <= length(s); n++) {
+        c = substr(s, n, 1)
+        if (c == "{") depth++
+        else if (c == "}") { depth--; if (depth == 0) break }
+        body = body c
+      }
+      count = split(body, pair, ",")
+      for (k = 1; k <= count; k++) {
+        if (match(pair[k], /"[^"]+"[ \t]*:/)) {
+          key = substr(pair[k], RSTART + 1)
+          print substr(key, 1, index(key, "\"") - 1)
+        }
+      }
+    }'
+}
+has_script() { pkg_scripts | grep -qxF "$1"; }
+
+# The first of these script names the project actually has.
+first_script() {
+  local n
+  for n in "$@"; do
+    if has_script "$n"; then printf '%s' "$n"; return 0; fi
+  done
+  return 1
+}
+
+# The scaffolded CLAUDE.md ships a placeholder where the project's commands
+# belong, and every agent in the loop reads that section every iteration. A
+# Node project already states its commands in package.json, so fill them in
+# rather than leave the loop to guess.
+preset_fill_commands() {
+  local cm="$RALPH_WORKSPACE/CLAUDE.md" pm install block name
+  [ -f "$cm" ] || return 0
+  grep -q '# fill in' "$cm" || return 0
+  pm="$(detect_pm)"
+  [ -n "$pm" ] || return 0
+
+  case "$pm" in
+    pnpm) install="pnpm install --frozen-lockfile" ;;
+    npm)  install="npm ci" ;;
+    *)    install="$pm install" ;;
+  esac
+  block="$install"
+  for name in \
+      "$(first_script typecheck type-check tsc || true)" \
+      "$(first_script test:run test:ci test || true)" \
+      "$(first_script lint || true)"; do
+    [ -n "$name" ] && block="$block
+$pm run $name"
+  done
+  if has_script build; then
+    block="$block
+# $pm run build   # add once you have seen it pass inside the sandbox"
+  fi
+
+  # Rewritten through a temp file: `sed -i` takes different arguments on macOS
+  # and on Linux, and `awk -v` will not carry a multi-line value on either.
+  local tmp line
+  tmp="$(mktemp)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '# fill in'*) printf '%s\n' "$block" ;;
+      *)            printf '%s\n' "$line" ;;
+    esac
+  done < "$cm" > "$tmp"
+  mv "$tmp" "$cm"
+  printf '  fill    CLAUDE.md  (commands from package.json)\n'
+}
+
+# A preset's package manager has to be in the image, and `ralph update` only
+# keeps it if it is written down. The version comes from package.json's
+# packageManager field when it has one, so the sandbox and the host agree.
+preset_fill_config() {
+  local cfg="$RALPH_WORKSPACE/.ralph/config.env" pm ver
+  [ -f "$cfg" ] || return 0
+  grep -q 'RALPH_BUILD_ARGS' "$cfg" && return 0
+  pm="$(detect_pm)"
+  [ -n "$pm" ] || return 0
+  if [ "$pm" = "npm" ]; then
+    cat >> "$cfg" <<'EOF'
+
+# npm is already in the sandbox image, so there is nothing to add here.
+EOF
+    return 0
+  fi
+  ver="$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+           "$RALPH_WORKSPACE/package.json" 2>/dev/null | head -1)"
+  case "$ver" in "$pm@"*) : ;; *) ver="$pm" ;; esac
+  {
+    cat <<'EOF'
+
+# The image ships npm only, and `ralph update` rebuilds it from scratch:
+# without this line the sandbox loses the project's package manager halfway
+# through a run, which looks like a broken project rather than a lost flag.
+EOF
+    printf 'RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=%s"\n' "$ver"
+  } >> "$cfg"
+  printf '  fill    .ralph/config.env  (%s for the image)\n' "$ver"
+}
+
+# The stack's rules are one file, so the two entry points cannot drift from
+# each other. CLAUDE.md imports it; AGENTS.md is told to read it, because
+# Codex does not follow imports.
+preset_link_rules() {
+  [ -f "$RALPH_WORKSPACE/.ralph/rules.md" ] || return 0
+  local f="$RALPH_WORKSPACE/CLAUDE.md"
+  if [ -f "$f" ] && ! grep -q '.ralph/rules.md' "$f"; then
+    printf '\n## Stack rules\n\n@.ralph/rules.md\n' >> "$f"
+    printf '  link    CLAUDE.md -> .ralph/rules.md\n'
+  fi
+  f="$RALPH_WORKSPACE/AGENTS.md"
+  if [ -f "$f" ] && ! grep -q '.ralph/rules.md' "$f"; then
+    cat >> "$f" <<'EOF'
+
+## Stack rules
+
+**Read `.ralph/rules.md` before you touch code.** It holds the rules for this
+stack: what the sandbox cannot do, and the mistakes that cost the most here.
+It is the same file `CLAUDE.md` imports, so the two cannot drift.
+EOF
+    printf '  link    AGENTS.md -> .ralph/rules.md\n'
+  fi
+}
+
+cmd_init() {
+  local force=0 preset="" dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force)    force=1; shift ;;
+      --preset)   [ $# -ge 2 ] || die "--preset needs a name (have: $(preset_names | tr '\n' ' '))"
+                  preset="$2"; shift 2 ;;
+      --preset=*) preset="${1#*=}"; shift ;;
+      *) die "unknown argument: $1 (expected --force or --preset NAME)" ;;
+    esac
+  done
+
+  local src="$RALPH_ROOT/templates"
+  [ -d "$src" ] || die "templates not found at $src"
+  [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
+
+  if [ -n "$preset" ]; then
+    case "$preset" in
+      */*|.*) die "bad preset name: $preset" ;;
+    esac
+    dir="$RALPH_ROOT/presets/$preset"
+    [ -d "$dir" ] || die "unknown preset '$preset' (have: $(preset_names | tr '\n' ' '))"
+  fi
+
+  # The preset goes down first and the templates fill in the rest, so a file
+  # the preset has its own version of -- PRD.md -- is the one that lands.
+  local preset_rels=""
+  if [ -n "$dir" ] && [ -d "$dir/files" ]; then
+    info "preset: $preset"
+    preset_rels="$(cd "$dir/files" && find . -type f | sed 's|^\./||' | tr '\n' ' ')"
+    scaffold_tree "$dir/files" "$force"
+  fi
+  scaffold_tree "$src" "$force" "$preset_rels"
+
+  if [ -n "$dir" ]; then
+    preset_fill_commands
+    preset_fill_config
+    preset_link_rules
+    policy_merge "$dir/allowlist" "the $preset preset" \
+      "policy already has every host the $preset preset needs"
+  fi
+
+  info "$_scaffold_created file(s) created, $_scaffold_skipped left alone"
+  if [ "$_scaffold_skipped" -gt 0 ] && [ "$force" -eq 0 ]; then
     info "'ralph init --force' would overwrite them"
   fi
   cat <<'__NEXT__'
@@ -1185,6 +1395,15 @@ Next:
   2. ralph loop
 
 __NEXT__
+  if [ -n "$dir" ]; then
+    cat <<'__PRESET_NEXT__'
+The preset also wrote .ralph/config.env, which `ralph` reads on the host. If
+it added a package manager for the image, run `ralph build` before the loop.
+`ralph status` shows what is in effect and `ralph policy ls` what is now
+reachable.
+
+__PRESET_NEXT__
+  fi
 }
 
 # `loop` is `run` with a different entrypoint: the agent is driven by
@@ -1385,6 +1604,7 @@ COMMANDS
   ralph [run] [args...]   Launch the agent over the current directory (default)
   ralph login [provider]  Sign the sandbox in to anthropic or codex (do this first)
   ralph init [--force]    Scaffold the Ralph loop: PRD, prompts, state, subagents
+  ralph init --preset NAME  ...and a stack's rules, settings and egress hosts
   ralph loop [N]          Run until the PRD is done (N caps the iterations)
   ralph model [role model]  Show, or change, the model behind each role
   ralph shell [args...]   Open a shell in the sandbox instead

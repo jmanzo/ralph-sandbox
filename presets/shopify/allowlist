@@ -1,0 +1,12 @@
+# Extra egress for a Shopify app, merged into your own allowlist by
+# `ralph init --preset shopify`. It is your file afterwards: remove what you
+# do not need with `ralph policy edit`, and check a host with
+# `ralph policy test HOST`.
+
+# prisma generate downloads a query engine built for the sandbox's platform,
+# and it runs on every install.
+^binaries\.prisma\.sh$
+
+# shopify.dev serves the API reference that the shopify-dev-mcp server reads.
+# Delete this line if the loop does not use that server.
+^shopify\.dev$
