@@ -180,6 +180,14 @@ RALPH_MODE="${RALPH_MODE:-direct}"
 #   RALPH_ISOLATE="node_modules packages/*/node_modules"
 RALPH_ISOLATE="${RALPH_ISOLATE:-}"
 
+# Files the agent must not read, workspace-relative and separated by spaces.
+# Each one is mounted over with an empty file, so a .env full of live
+# credentials reads as nothing inside the sandbox while the host keeps its
+# copy. Globs are expanded against the workspace:
+#   RALPH_MASK=".env .env.local"
+# This closes one hole; it is not a secret boundary. See docs/security.md.
+RALPH_MASK="${RALPH_MASK:-}"
+
 # Deny-by-default egress through the proxy sidecar.
 RALPH_NETWORK_POLICY="${RALPH_NETWORK_POLICY:-on}"
 RALPH_ALLOWLIST="${RALPH_ALLOWLIST:-$_cfg_home/allowlist}"
@@ -351,6 +359,25 @@ isolate_prepare() {
   docker run --rm -u 0:0 -v "$vol:/v" --entrypoint chown "$RALPH_IMAGE" \
     "$(sandbox_ids)" /v >/dev/null
   info "$vol created for $2"
+}
+
+# What a masked file is replaced with. A plain empty file, not /dev/null: a
+# library that stats .env before reading it should find a regular file, and a
+# character device is not one. Mode 444 because there is nothing in it to
+# protect, and an unreadable file would be an error where an empty one is the
+# answer.
+RALPH_EMPTY_FILE=""
+mask_source() {
+  if [ -z "$RALPH_EMPTY_FILE" ]; then
+    local dir="$_data_home/run"
+    mkdir -p "$dir" && chmod 700 "$dir"
+    RALPH_EMPTY_FILE="$dir/empty"
+    # Mode 444 left by an earlier run would make the truncate fail.
+    [ -e "$RALPH_EMPTY_FILE" ] && chmod 600 "$RALPH_EMPTY_FILE"
+    : > "$RALPH_EMPTY_FILE"
+    chmod 444 "$RALPH_EMPTY_FILE"
+  fi
+  printf '%s' "$RALPH_EMPTY_FILE"
 }
 
 # API keys go into the sandbox through a file mounted read-only, not through
@@ -695,10 +722,13 @@ cmd_run() {
 
   # --- workspace mode -----------------------------------------------------
   # Clone and mountless workspaces are different things; keep them apart.
-  local ws_volume iso_path iso_vol
+  local ws_volume iso_path iso_vol mask_path mask_file
   ws_volume="$(ws_volume_name)"
   if [ -n "$RALPH_ISOLATE" ] && [ "$RALPH_MODE" != "direct" ]; then
     warn "RALPH_ISOLATE has nothing to do in $RALPH_MODE mode -- that workspace is already the sandbox's own"
+  fi
+  if [ -n "$RALPH_MASK" ] && [ "$RALPH_MODE" = "none" ]; then
+    warn "RALPH_MASK has nothing to do in none mode -- no host file is mounted"
   fi
   case "$RALPH_MODE" in
     direct)
@@ -717,11 +747,23 @@ cmd_run() {
         isolate_prepare "$iso_vol" "$iso_path"
         args+=(-v "$iso_vol:/workspace/$iso_path")
       done < <(expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE)
+      while IFS= read -r mask_path; do
+        [ -n "$mask_path" ] || continue
+        args+=(-v "$(mask_source):/workspace/$mask_path:ro")
+      done < <(expand_ws_paths "$RALPH_MASK" RALPH_MASK)
       ;;
     clone)
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
       volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
       args+=(-v "$RALPH_WORKSPACE:/run/sandbox/source:ro" -v "$ws_volume:/workspace")
+      while IFS= read -r mask_path; do
+        [ -n "$mask_path" ] || continue
+        mask_file="$(mask_source)"
+        # Both ends: the source the private copy is seeded from, and the copy
+        # itself, which may have been seeded before masking was turned on.
+        args+=(-v "$mask_file:/run/sandbox/source/$mask_path:ro")
+        args+=(-v "$mask_file:/workspace/$mask_path:ro")
+      done < <(expand_ws_paths "$RALPH_MASK" RALPH_MASK)
       ;;
     none)
       volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
@@ -999,6 +1041,18 @@ cmd_status() {
       printf 'isolate       nothing to do in %s mode\n' "$RALPH_MODE"
     fi
   fi
+  case "$RALPH_MODE" in
+    direct|clone)
+      local masked
+      masked="$(expand_ws_paths "$RALPH_MASK" RALPH_MASK | tr '\n' ' ')"
+      masked="${masked% }"
+      if [ -z "$masked" ]; then
+        printf 'mask          off  (the agent can read every file in the workspace)\n'
+      else
+        printf 'mask          %s  (empty inside the sandbox)\n' "$masked"
+      fi
+      ;;
+  esac
   if image_exists "$RALPH_IMAGE"; then
     printf 'image         %s  %s\n' "$RALPH_IMAGE" \
       "$(docker image inspect "$RALPH_IMAGE" --format '{{.Architecture}}' 2>/dev/null)"
@@ -1389,6 +1443,7 @@ KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
   RALPH_MOUNT_GITCONFIG   [1]      RALPH_MOUNT_SSH     [0]
   RALPH_ISOLATE           dependency dirs the sandbox keeps its own copy of
+  RALPH_MASK              workspace files that read empty inside the sandbox
 
   A project can carry its own settings in .ralph/config.env, which travels
   with the repository. Only the convenience settings may come from there --

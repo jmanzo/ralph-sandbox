@@ -521,6 +521,42 @@ jobs:
           RALPH_WORKSPACE=/tmp/iso ./ralph clean workspace
           ! docker volume ls -q | grep -q '^ralph-iso-'
 
+      - name: Masked files read empty inside the sandbox, in both modes
+        run: |
+          rm -rf /tmp/mask && mkdir -p /tmp/mask
+          echo 'RESEND_KEY=live' > /tmp/mask/.env
+          echo 'TOKEN=live' > /tmp/mask/.env.sentry
+          echo ok > /tmp/mask/app.txt
+
+          out=$(RALPH_WORKSPACE=/tmp/mask RALPH_NETWORK_POLICY=off \
+                RALPH_MASK=".env .env.*" ./ralph shell -lc '
+                  echo "env=[$(cat /workspace/.env)]"
+                  echo "sentry=[$(cat /workspace/.env.sentry)]"
+                  echo "app=[$(cat /workspace/app.txt)]"
+                  stat -c "%F" /workspace/.env
+                  echo leak > /workspace/.env 2>&1 || echo WRITE-REFUSED' 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'env=\[\]'
+          echo "$out" | grep -q 'sentry=\[\]'
+          echo "$out" | grep -q 'app=\[ok\]'
+          # A regular file, not a character device: libraries stat it first.
+          echo "$out" | grep -q 'regular empty file'
+          echo "$out" | grep -q 'WRITE-REFUSED'
+          # The host keeps its copy.
+          grep -q live /tmp/mask/.env
+
+          # Clone mode masks the seed AND the private copy.
+          out=$(RALPH_WORKSPACE=/tmp/mask RALPH_MODE=clone RALPH_NETWORK_POLICY=off \
+                RALPH_MASK=".env" ./ralph shell -lc '
+                  echo "copy=[$(cat /workspace/.env)]"
+                  echo "src=[$(cat /run/sandbox/source/.env)]"
+                  echo "app=[$(cat /workspace/app.txt)]"' 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'copy=\[\]'
+          echo "$out" | grep -q 'src=\[\]'
+          echo "$out" | grep -q 'app=\[ok\]'
+          RALPH_WORKSPACE=/tmp/mask RALPH_MODE=clone ./ralph clean workspace
+
       - name: A project's own settings cannot loosen the sandbox
         run: |
           rm -rf /tmp/pcfg && mkdir -p /tmp/pcfg/.ralph

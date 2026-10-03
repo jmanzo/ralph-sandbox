@@ -49,6 +49,7 @@ It is **not** protecting against:
 | Resources | `--pids-limit` (default 2048), optional memory and cpu limits | -- |
 | Recovery | Host-side snapshot before every `direct` run: a hidden ref plus a bundle outside the mount | CI: "Snapshots survive deletion of the whole workspace" |
 | Credentials | Logins live in a Docker volume; host API keys arrive through a mode-600 file, not `-e`; webhooks and bot tokens never enter at all | CI: "Slack, Discord and Telegram each get the end-of-run message" (posted from the host) |
+| Workspace secrets | `RALPH_MASK` mounts an empty read-only file over each listed path, in `direct` mode and over both ends of a `clone` | CI: "Masked files read empty inside the sandbox, in both modes" |
 | Spend | Stall, repeated-failure, three-strikes and spend-ceiling guardrails in `loop.sh` | CI: the `loop` job |
 | Supply chain | Base images pinned by digest, agents by version, actions by SHA; no scripts piped into bash at build time; Dependabot moves the pins | -- |
 
@@ -76,6 +77,13 @@ claim; a report that one of them is worse than described is still welcome.
   the container, not anything within it.
 - **`RALPH_MOUNT_SSH=1` hands the agent your keys.** Off by default. If you enable
   it so the agent can push, use a key scoped to that.
+- **`RALPH_MASK` hides a file, not a secret.** The same credential may sit in
+  the git history, in the environment the agent inherits, or behind a mounted
+  `~/.ssh`, and an agent that can write the workspace can edit
+  `.ralph/config.env` -- which is why `ralph` mounts that file back read-only,
+  and why `ralph status` prints what is masked. Rotate anything the agent has
+  already seen; masking is for keeping it out of the next run, not for undoing
+  the last one.
 - **The allowlist is only as tight as you make it.** Anything reachable is a
   possible destination for your source code.
 - **An unattended loop is still an unattended loop.** The budget, the stall

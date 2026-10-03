@@ -9,6 +9,9 @@ version` prints the release you are running.
 
 ### Added
 
+- `RALPH_MASK`: workspace files mounted over with an empty read-only file, so
+  a `.env` of live credentials reads as nothing inside the sandbox while the
+  host keeps its copy. Covers both ends of a `clone`.
 - `RALPH_ISOLATE`: dependency directories the sandbox keeps its own copy of,
   so a Linux container and a macOS host stop overwriting each other's
   compiled binaries in `direct` mode. Globs are expanded against the

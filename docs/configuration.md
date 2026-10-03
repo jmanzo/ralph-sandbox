@@ -40,6 +40,7 @@ shows what is in effect. The loop's own variables are explained in
 | `RALPH_MOUNT_GITCONFIG` | `1` | Mount `~/.gitconfig` read-only |
 | `RALPH_MOUNT_SSH` | `0` | Mount `~/.ssh` read-only (see below) |
 | `RALPH_ISOLATE` | -- | Dependency dirs the sandbox keeps its own copy of |
+| `RALPH_MASK` | -- | Workspace files that read empty inside the sandbox |
 | `RALPH_DOCKER_ARGS` | -- | Extra `docker run` arguments |
 
 ### Using a different agent
@@ -89,6 +90,29 @@ Two things worth knowing: the sandbox starts with the directory *empty*, so
 the first iteration has to install; and if the directory does not exist on the
 host, Docker creates an empty one there. In `clone` and `none` modes the
 setting does nothing, because the workspace is already the sandbox's own.
+
+### Hiding files from the agent
+
+A `.env` in a `direct`-mode workspace is readable by the agent, and
+`github.com` is on the default allowlist, so there is somewhere it could go.
+If the project's tests mock the services those credentials belong to -- and
+they usually do -- the agent does not need them:
+
+```sh
+RALPH_MASK=".env .env.local"
+```
+
+Each listed file is mounted over with an empty, read-only file. It reads as
+nothing inside the sandbox, writes to it fail, and the host keeps its own copy
+untouched. Globs are expanded against the workspace, so `.env.*` covers a file
+you forgot -- though it also covers `.env.example`, which the agent may
+legitimately want to read, so listing names is usually better. In `clone` mode
+both the read-only source and the private copy are masked. `ralph status`
+prints what is masked, and prints `mask off` when nothing is.
+
+This closes one hole rather than drawing a boundary: the same secret may be in
+the git history, in the process environment, or reachable with a mounted
+`~/.ssh`. See [security.md](security.md).
 
 ### Settings that live in the project
 
