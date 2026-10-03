@@ -41,6 +41,7 @@ shows what is in effect. The loop's own variables are explained in
 | `RALPH_MOUNT_SSH` | `0` | Mount `~/.ssh` read-only (see below) |
 | `RALPH_ISOLATE` | -- | Dependency dirs the sandbox keeps its own copy of |
 | `RALPH_MASK` | -- | Workspace files that read empty inside the sandbox |
+| `RALPH_BUILD_ARGS` | -- | `docker build` args kept across `build` and `update` |
 | `RALPH_DOCKER_ARGS` | -- | Extra `docker run` arguments |
 
 ### Using a different agent
@@ -158,6 +159,20 @@ ralph build \
   --build-arg EXTRA_APT_PACKAGES="golang-go postgresql-client" \
   --build-arg EXTRA_NPM_PACKAGES="pnpm typescript"
 ```
+
+`ralph update` rebuilds from scratch and does not remember what you typed last
+time, so a toolchain added on the command line disappears at the next update.
+Put it in `RALPH_BUILD_ARGS` instead -- in `~/.config/ralph/config.env`, or in
+the project's own `.ralph/config.env` -- and both `build` and `update` apply
+it:
+
+```sh
+RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=pnpm"
+```
+
+A `--build-arg` typed on the command line still wins over a remembered one.
+The image is shared by every project, so what one project adds is simply
+present for the others.
 
 | Build arg | Default |
 | --- | --- |

@@ -9,6 +9,9 @@ version` prints the release you are running.
 
 ### Added
 
+- `RALPH_BUILD_ARGS`: `docker build` arguments remembered in a config file, so
+  `ralph update` keeps the toolchain `ralph build` was given instead of
+  silently dropping it.
 - `RALPH_MASK`: workspace files mounted over with an empty read-only file, so
   a `.env` of live credentials reads as nothing inside the sandbox while the
   host keeps its copy. Covers both ends of a `clone`.

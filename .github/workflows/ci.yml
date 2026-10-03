@@ -50,6 +50,40 @@ jobs:
           ignore-unfixed: true
           exit-code: 0
 
+  cli:
+    # The `ralph` CLI itself, with a stub `docker` on PATH: argument order and
+    # scaffolding, neither of which needs an image or a daemon.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Remembered build args reach docker build, and the command line still wins
+        run: |
+          mkdir -p /tmp/fakebin
+          cat > /tmp/fakebin/docker <<'SH'
+          #!/usr/bin/env bash
+          echo "docker $*" >> /tmp/docker-calls
+          exit 0
+          SH
+          chmod +x /tmp/fakebin/docker
+
+          rm -f /tmp/docker-calls
+          PATH=/tmp/fakebin:$PATH \
+            RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=pnpm@9.15.9" \
+            ./ralph build --build-arg NODE_MAJOR=24
+          cat /tmp/docker-calls
+          # Config first, command line last: docker takes the last --build-arg.
+          grep -qE 'EXTRA_NPM_PACKAGES=pnpm@9\.15\.9 --build-arg NODE_MAJOR=24' /tmp/docker-calls
+
+          # `update` asks npm for whatever is current, then lets a project pin
+          # an agent version back.
+          rm -f /tmp/docker-calls
+          PATH=/tmp/fakebin:$PATH \
+            RALPH_BUILD_ARGS="--build-arg CLAUDE_VERSION=2.1.278" ./ralph update
+          cat /tmp/docker-calls
+          grep -qE 'CLAUDE_VERSION=latest .*CLAUDE_VERSION=2\.1\.278' /tmp/docker-calls
+          git diff --exit-code proxy/default.allowlist
+
   loop:
     runs-on: ubuntu-latest
     steps:
