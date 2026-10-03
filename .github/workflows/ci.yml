@@ -94,10 +94,9 @@ jobs:
             "scripts": {
               "build": "remix vite:build",
               "typecheck": "tsc --noEmit",
-              "test:run": "vitest run",
-              "lint": "eslint ."
+              "test:run": "vitest run"
             },
-            "devDependencies": { "lint": "1.0.0" }
+            "devDependencies": { "lint": "1.0.0", "test": "1.0.0" }
           }
           JSON
           touch /tmp/app/pnpm-lock.yaml
@@ -112,16 +111,23 @@ jobs:
           # Commands out of package.json; package manager out of the lockfile.
           grep -q 'pnpm install --frozen-lockfile' /tmp/app/CLAUDE.md
           grep -q 'pnpm run test:run' /tmp/app/CLAUDE.md
-          ! grep -q '# fill in' /tmp/app/CLAUDE.md
+          if grep -q '# fill in' /tmp/app/CLAUDE.md; then
+            echo "the placeholder survived"; exit 1
+          fi
           grep -q 'EXTRA_NPM_PACKAGES=pnpm@9.15.9' /tmp/app/.ralph/config.env
-          # A dependency named like a script is not a script.
-          ! grep -q 'pnpm run lint' /tmp/app/CLAUDE.md
+          # A dependency named like a script is not a script: neither `lint`
+          # nor `test` is in this fixture's scripts, only in its dependencies.
+          if grep -qE 'run (lint|test)$' /tmp/app/CLAUDE.md; then
+            echo "a dependency was taken for a script"; exit 1
+          fi
           # The stack's hosts, in the user's own policy.
           grep -q 'binaries' /tmp/cfg/ralph/allowlist
           # A preset cannot ask for anything a project may not set.
           grep -q RALPH_ISOLATE /tmp/app/.ralph/config.env
-          ! grep -qE '^RALPH_(DOCKER_ARGS|NETWORK_POLICY|MODE|IMAGE|HARDEN|MOUNT_SSH)=' \
-              /tmp/app/.ralph/config.env
+          if grep -qE '^RALPH_(DOCKER_ARGS|NETWORK_POLICY|MODE|IMAGE|HARDEN|MOUNT_SSH)=' \
+               /tmp/app/.ralph/config.env; then
+            echo "a preset asked for a setting a project may not set"; exit 1
+          fi
 
           # Twice is the same as once.
           out=$(RALPH_WORKSPACE=/tmp/app ./ralph init --preset shopify 2>&1)
@@ -130,7 +136,9 @@ jobs:
           test "$(grep -c '## Stack rules' /tmp/app/CLAUDE.md)" = 1
           test "$(grep -c RALPH_BUILD_ARGS /tmp/app/.ralph/config.env)" = 1
 
-          ./ralph init --preset nope 2>&1 | grep -q "unknown preset"
+          # `die` exits 1 and the step runs with pipefail, so capture first.
+          out=$(./ralph init --preset nope 2>&1 || true)
+          echo "$out" | grep -q "unknown preset"
 
   loop:
     runs-on: ubuntu-latest
@@ -601,7 +609,9 @@ jobs:
           # And what the sandbox installed did not reach the host's copy.
           test "$(cat /tmp/iso/node_modules/marker)" = host
           RALPH_WORKSPACE=/tmp/iso ./ralph clean workspace
-          ! docker volume ls -q | grep -q '^ralph-iso-'
+          if docker volume ls -q | grep -q '^ralph-iso-'; then
+            echo "clean workspace left an isolate volume behind"; exit 1
+          fi
 
       - name: Masked files read empty inside the sandbox, in both modes
         run: |
@@ -664,8 +674,9 @@ jobs:
           # And refused in effect, not just in the warning.
           test ! -e /tmp/pwned
           echo "$out" | grep -q "proxy=http://proxy:8888"
-          ! echo "$out" | grep -q "HOST-MOUNTED"
-          ! echo "$out" | grep -q "SSH-MOUNTED"
+          if echo "$out" | grep -qE "HOST-MOUNTED|SSH-MOUNTED"; then
+            echo "a project setting put a host mount in the sandbox"; exit 1
+          fi
 
       - name: The agent cannot rewrite the settings it runs under
         run: |
