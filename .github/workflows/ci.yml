@@ -497,6 +497,30 @@ jobs:
             test ! -e /var/run/docker.sock || { echo "socket exposed"; exit 1; }
           '
 
+      - name: Isolated directories keep host and sandbox dependencies apart
+        run: |
+          rm -rf /tmp/iso && mkdir -p /tmp/iso/node_modules /tmp/iso/pkg/a/node_modules
+          echo host > /tmp/iso/node_modules/marker
+          echo host > /tmp/iso/pkg/a/node_modules/marker
+          echo keep > /tmp/iso/app.txt
+          out=$(RALPH_WORKSPACE=/tmp/iso RALPH_NETWORK_POLICY=off \
+                RALPH_ISOLATE="node_modules pkg/*/node_modules" ./ralph shell -lc '
+                  cat /workspace/node_modules/marker 2>/dev/null || echo EMPTY
+                  cat /workspace/pkg/a/node_modules/marker 2>/dev/null || echo EMPTY-NESTED
+                  echo sandbox > /workspace/node_modules/marker && echo WROTE-OK
+                  cat /workspace/app.txt' 2>&1)
+          echo "$out"
+          # The sandbox sees its own, empty, writable copy -- the glob counts too.
+          echo "$out" | grep -q '^EMPTY$'
+          echo "$out" | grep -q '^EMPTY-NESTED$'
+          echo "$out" | grep -q '^WROTE-OK$'
+          # Everything else in the workspace is still the host's live tree.
+          echo "$out" | grep -q '^keep$'
+          # And what the sandbox installed did not reach the host's copy.
+          test "$(cat /tmp/iso/node_modules/marker)" = host
+          RALPH_WORKSPACE=/tmp/iso ./ralph clean workspace
+          ! docker volume ls -q | grep -q '^ralph-iso-'
+
       - name: A project's own settings cannot loosen the sandbox
         run: |
           rm -rf /tmp/pcfg && mkdir -p /tmp/pcfg/.ralph

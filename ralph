@@ -169,6 +169,17 @@ RALPH_NOTIFY_ON="${RALPH_NOTIFY_ON:-always}"
 #   none   -- no host filesystem at all
 RALPH_MODE="${RALPH_MODE:-direct}"
 
+# Directories the sandbox keeps its own copy of, workspace-relative and
+# separated by spaces. In direct mode the container edits the host's tree, so
+# a directory of compiled dependencies -- node_modules, .venv, target -- ends
+# up shared between a host that may be macOS and a container that is always
+# Linux, and neither can run the other's binaries: whichever installs last
+# breaks the other. Each path here gets a Docker volume of its own mounted
+# over it. Globs are expanded against the workspace, so one line covers a
+# monorepo:
+#   RALPH_ISOLATE="node_modules packages/*/node_modules"
+RALPH_ISOLATE="${RALPH_ISOLATE:-}"
+
 # Deny-by-default egress through the proxy sidecar.
 RALPH_NETWORK_POLICY="${RALPH_NETWORK_POLICY:-on}"
 RALPH_ALLOWLIST="${RALPH_ALLOWLIST:-$_cfg_home/allowlist}"
@@ -278,6 +289,68 @@ ws_volume_name() {
     none) printf 'ralph-box-%s' "$(project_slug)" ;;
     *)    printf 'ralph-ws-%s'  "$(project_slug)" ;;
   esac
+}
+
+# Workspace-relative and nothing else: an absolute path or a .. escape would
+# put a mount somewhere the caller never meant, and these lists can arrive
+# from a project's own config.env.
+check_ws_path() {
+  case "$1" in
+    '')   die "$2: empty path" ;;
+    /*)   die "$2: '$1' must be relative to the workspace" ;;
+    *..*) die "$2: '$1' must not contain .." ;;
+  esac
+}
+
+# Expand globs against the workspace. A literal entry survives not existing
+# yet -- node_modules on a fresh clone is exactly when isolating it matters --
+# while a glob can only ever match what is already there.
+expand_ws_paths() {
+  local list="$1" label="$2" p hit
+  for p in $list; do
+    check_ws_path "$p" "$label"
+    case "$p" in
+      *[*?]*)
+        # Splitting and globbing are the point of this loop.
+        # shellcheck disable=SC2231
+        for hit in "$RALPH_WORKSPACE"/$p; do
+          [ -e "$hit" ] || continue
+          printf '%s\n' "${hit#"$RALPH_WORKSPACE"/}"
+        done
+        ;;
+      *) printf '%s\n' "$p" ;;
+    esac
+  done
+}
+
+# One volume per workspace and path, so two checkouts of the same repo, or two
+# projects that each have a node_modules, never end up sharing one.
+isolate_volume_name() {
+  printf 'ralph-iso-%s-%s' "$(project_slug)" \
+    "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9_.-' '-')"
+}
+
+# A fresh volume belongs to root and the sandbox is an unprivileged user, so
+# without the chown the project's first install dies on "permission denied".
+# The ids come from the image rather than a constant because on Linux `ralph
+# build` bakes the host user's into it.
+_sandbox_ids=""
+sandbox_ids() {
+  if [ -z "$_sandbox_ids" ]; then
+    _sandbox_ids="$(docker run --rm --entrypoint sh "$RALPH_IMAGE" \
+                      -c 'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null)"
+    [ -n "$_sandbox_ids" ] || _sandbox_ids="1000:1000"
+  fi
+  printf '%s' "$_sandbox_ids"
+}
+
+isolate_prepare() {
+  local vol="$1"
+  volume_exists "$vol" && return 0
+  docker volume create "$vol" >/dev/null
+  docker run --rm -u 0:0 -v "$vol:/v" --entrypoint chown "$RALPH_IMAGE" \
+    "$(sandbox_ids)" /v >/dev/null
+  info "$vol created for $2"
 }
 
 # API keys go into the sandbox through a file mounted read-only, not through
@@ -622,8 +695,11 @@ cmd_run() {
 
   # --- workspace mode -----------------------------------------------------
   # Clone and mountless workspaces are different things; keep them apart.
-  local ws_volume
+  local ws_volume iso_path iso_vol
   ws_volume="$(ws_volume_name)"
+  if [ -n "$RALPH_ISOLATE" ] && [ "$RALPH_MODE" != "direct" ]; then
+    warn "RALPH_ISOLATE has nothing to do in $RALPH_MODE mode -- that workspace is already the sandbox's own"
+  fi
   case "$RALPH_MODE" in
     direct)
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
@@ -635,6 +711,12 @@ cmd_run() {
       # -- nothing masked, no dependency directory of its own.
       [ -n "$RALPH_PROJECT_CONFIG" ] &&
         args+=(-v "$RALPH_PROJECT_CONFIG:/workspace/.ralph/config.env:ro")
+      while IFS= read -r iso_path; do
+        [ -n "$iso_path" ] || continue
+        iso_vol="$(isolate_volume_name "$iso_path")"
+        isolate_prepare "$iso_vol" "$iso_path"
+        args+=(-v "$iso_vol:/workspace/$iso_path")
+      done < <(expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE)
       ;;
     clone)
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
@@ -909,6 +991,14 @@ cmd_status() {
   if [ -n "$RALPH_PROJECT_CONFIG" ]; then
     printf 'project cfg   %s\n' "$RALPH_PROJECT_CONFIG"
   fi
+  if [ -n "$RALPH_ISOLATE" ]; then
+    if [ "$RALPH_MODE" = "direct" ]; then
+      printf 'isolate       %s  (sandbox keeps its own)\n' \
+        "$(expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE | tr '\n' ' ')"
+    else
+      printf 'isolate       nothing to do in %s mode\n' "$RALPH_MODE"
+    fi
+  fi
   if image_exists "$RALPH_IMAGE"; then
     printf 'image         %s  %s\n' "$RALPH_IMAGE" \
       "$(docker image inspect "$RALPH_IMAGE" --format '{{.Architecture}}' 2>/dev/null)"
@@ -935,6 +1025,14 @@ cmd_clean() {
       local ws_volume; ws_volume="$(ws_volume_name)"
       if volume_exists "$ws_volume"; then docker volume rm "$ws_volume"
       else info "no sandbox workspace volume for $RALPH_WORKSPACE"; fi
+      # The isolated dependency directories belong to the same workspace, and
+      # a stale one is how a project that changed package manager stays
+      # broken.
+      local iso
+      for iso in $(docker volume ls -q \
+                     --filter "name=^ralph-iso-$(project_slug)-" 2>/dev/null); do
+        docker volume rm "$iso"
+      done
       ;;
     image)
       if image_exists "$RALPH_IMAGE"; then docker image rm "$RALPH_IMAGE"; else info "no image"; fi
@@ -1290,6 +1388,7 @@ KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_NOTIFY_ON         always | problem             [always]
   RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
   RALPH_MOUNT_GITCONFIG   [1]      RALPH_MOUNT_SSH     [0]
+  RALPH_ISOLATE           dependency dirs the sandbox keeps its own copy of
 
   A project can carry its own settings in .ralph/config.env, which travels
   with the repository. Only the convenience settings may come from there --

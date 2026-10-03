@@ -39,6 +39,7 @@ shows what is in effect. The loop's own variables are explained in
 | `RALPH_WORKSPACE` | `$PWD` | Directory to sandbox |
 | `RALPH_MOUNT_GITCONFIG` | `1` | Mount `~/.gitconfig` read-only |
 | `RALPH_MOUNT_SSH` | `0` | Mount `~/.ssh` read-only (see below) |
+| `RALPH_ISOLATE` | -- | Dependency dirs the sandbox keeps its own copy of |
 | `RALPH_DOCKER_ARGS` | -- | Extra `docker run` arguments |
 
 ### Using a different agent
@@ -61,6 +62,33 @@ Every project shares one login volume by default. To fully quarantine one:
 ```sh
 RALPH_HOME_VOLUME=ralph-home-clientwork ralph
 ```
+
+### Keeping host and sandbox dependencies apart
+
+In `direct` mode the sandbox edits your live tree, and the sandbox is Linux
+whether or not your machine is. A directory of compiled dependencies is then
+shared by two platforms that cannot run each other's binaries: install inside
+the sandbox and the host's `node_modules` stops working; don't, and nothing
+runs inside the sandbox.
+
+`RALPH_ISOLATE` gives each listed directory a Docker volume of its own, so
+both sides keep theirs:
+
+```sh
+RALPH_ISOLATE="node_modules packages/*/node_modules"
+```
+
+Paths are workspace-relative and space-separated; globs are expanded against
+the workspace, so one line covers a monorepo. The volumes are named after the
+workspace, created on first use and chowned to the sandbox user -- a fresh
+Docker volume belongs to root, and without that step the project's first
+install fails with "permission denied". `ralph clean workspace` removes them,
+which is the fix when a project changes package manager.
+
+Two things worth knowing: the sandbox starts with the directory *empty*, so
+the first iteration has to install; and if the directory does not exist on the
+host, Docker creates an empty one there. In `clone` and `none` modes the
+setting does nothing, because the workspace is already the sandbox's own.
 
 ### Settings that live in the project
 

@@ -9,6 +9,10 @@ version` prints the release you are running.
 
 ### Added
 
+- `RALPH_ISOLATE`: dependency directories the sandbox keeps its own copy of,
+  so a Linux container and a macOS host stop overwriting each other's
+  compiled binaries in `direct` mode. Globs are expanded against the
+  workspace; `ralph clean workspace` removes the volumes.
 - A project can carry its own ralph settings in `.ralph/config.env`, committed
   alongside the code, so a checkout runs the same way on every machine. Only
   the convenience settings may come from there; the egress policy, the
