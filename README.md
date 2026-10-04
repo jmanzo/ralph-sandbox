@@ -161,6 +161,55 @@ ralph apply                 # copy those changes onto the host (snapshots first)
 In `clone` mode the host tree is genuinely read-only -- a write attempt fails with
 `Read-only file system`.
 
+### Running a real project in `direct` mode
+
+Two things bite as soon as the workspace is a real project rather than a toy,
+and both are a mount:
+
+- **`RALPH_ISOLATE`** gives each listed directory a Docker volume of its own,
+  so the sandbox and the host stop overwriting each other's compiled
+  dependencies. The sandbox is Linux whether or not your machine is, and a
+  shared `node_modules` works for exactly one of them. The volumes are named
+  after the workspace and chowned to the sandbox user; `ralph clean workspace`
+  removes them. CI proves the host's copy survives an install inside the
+  sandbox.
+- **`RALPH_MASK`** mounts an empty read-only file over each listed path, so a
+  `.env` of live credentials reads as nothing inside the sandbox while your
+  copy stays as it is. CI proves it reads empty in both `direct` and `clone`
+  mode. It closes one hole rather than drawing a boundary -- the same secret
+  may be in the git history or the environment.
+
+```bash
+RALPH_ISOLATE="node_modules" RALPH_MASK=".env" ralph
+```
+
+Both are usually better set once, in the project:
+
+```sh
+# myapp/.ralph/config.env -- committed, read by `ralph` on the host
+RALPH_ISOLATE="node_modules"
+RALPH_MASK=".env"
+RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=pnpm"
+```
+
+A project may only set the convenience settings. The egress policy, the
+workspace mode, the image, docker arguments and the spend ceiling are not on
+that list, and the four loop limits that are on it may only be made stricter,
+so cloning a repository and running `ralph` in it cannot loosen the sandbox or
+spend your money; in `direct` mode the file is mounted back read-only so the
+agent cannot edit the settings its next run would use. CI proves both.
+
+Or get the whole setup for a stack in one command:
+
+```bash
+ralph init --preset shopify
+```
+
+A preset adds the rules every agent in the loop reads, the project's build and
+test commands read out of `package.json`, the settings above, a PRD skeleton,
+and the hosts the stack needs -- each one printed as it is added to *your*
+allowlist, which stays yours. See [docs/presets.md](docs/presets.md).
+
 ## Network policy
 
 Egress is **deny-by-default**. The sandbox sits on a Docker network created with
@@ -243,6 +292,7 @@ RALPH_MEMORY=8g RALPH_CPUS=4 ralph
 ralph [run] [args...]   Launch the agent over the current directory (default)
 ralph login [provider]  Sign the sandbox in to anthropic or codex, or `status`
 ralph init [--force]    Scaffold the loop: PRD, prompts, state, subagents
+ralph init --preset NAME  ...and a stack's rules, settings and egress hosts
 ralph loop [N]          Run until the PRD is done (N caps the iterations)
 ralph model [role model]  Show, or change, the model behind each role
 ralph shell             Open a shell in the sandbox
@@ -274,7 +324,8 @@ The full list, and the threat model they follow from, is in
 | | |
 | --- | --- |
 | [docs/loop.md](docs/loop.md) | The loop: roles and models, proposals, the Codex handover, guardrails, notifications, exit codes |
-| [docs/configuration.md](docs/configuration.md) | Every `RALPH_*` variable, using a different agent, per-project isolation, customizing the image |
+| [docs/configuration.md](docs/configuration.md) | Every `RALPH_*` variable, settings that live in the project, isolating dependencies, hiding files, customizing the image |
+| [docs/presets.md](docs/presets.md) | `ralph init --preset`: what a preset brings, what it cannot do, and the `shopify` one |
 | [docs/security.md](docs/security.md) | The threat model, the layers, and the known limits |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | What the common failures look like and what fixes them |
 | [SECURITY.md](SECURITY.md) | How to report a hole in the boundary |

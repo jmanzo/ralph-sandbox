@@ -20,18 +20,140 @@ done
 RALPH_ROOT="$(cd -P "$(dirname "$_self")" && pwd)"
 
 # ---------------------------------------------------------------------------
+# Messages. Up here because reading the config can already have something to
+# say about it.
+# ---------------------------------------------------------------------------
+die()  { printf 'ralph: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[2m==> %s\033[0m\n' "$*" >&2; }
+warn() { printf '\033[33mralph: %s\033[0m\n' "$*" >&2; }
+
+# ---------------------------------------------------------------------------
 # Config. Every value is overridable by env var, or in the config file.
 # ---------------------------------------------------------------------------
 _cfg_home="${XDG_CONFIG_HOME:-$HOME/.config}/ralph"
 _data_home="${XDG_DATA_HOME:-$HOME/.local/share}/ralph"
 RALPH_CONFIG="${RALPH_CONFIG:-$_cfg_home/config.env}"
+
+# What a project may set for itself in .ralph/config.env, so a checkout
+# carries the settings it needs to run rather than every machine keeping its
+# own copy. Convenience only. The egress policy, the workspace mode, the
+# image, docker arguments, the spend ceiling and what of your home directory
+# gets mounted are all absent from this list on purpose: a repository you have
+# only just cloned must not be able to loosen the sandbox it is about to run
+# inside.
+#
+# The four loop limits are on the list but clamped, not taken as given: see
+# RALPH_PROJECT_LIMITS below. RALPH_BUILD_ARGS is on it narrowed to
+# --build-arg: see only_build_args.
+RALPH_PROJECT_SETTABLE="RALPH_ISOLATE RALPH_MASK RALPH_BUILD_ARGS"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_MAX RALPH_LOOP_SLEEP"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_STALL RALPH_LOOP_FAILS"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_REPEAT RALPH_FALLBACK"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_MODEL_ORCHESTRATOR"
+RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_CODEX_MODEL RALPH_CODEX_EFFORT"
+
+# The subset of that list a project may only make STRICTER. Each one is a
+# guardrail that stops an unattended loop spending money -- loop.sh's
+# iteration cap, stall check, three-strikes and repeated-failure check -- so a
+# project saying "cap me at 20 iterations" is useful while a project saying
+# "never stop" would hand a cloned repository the wallet. The values arrive
+# before the defaults are in, so they are stashed and applied by
+# clamp_project_limits.
+RALPH_PROJECT_LIMITS="RALPH_LOOP_MAX RALPH_LOOP_STALL RALPH_LOOP_FAILS RALPH_LOOP_REPEAT"
+_project_limits=""
+
+# A value typed on the command line outranks both config files, so note which
+# of these names the environment already carried before either one is read.
+_env_given=""
+for _n in $RALPH_PROJECT_SETTABLE; do
+  eval "[ -n \"\${$_n+1}\" ]" && _env_given="$_env_given $_n"
+done
+
 # shellcheck disable=SC1090
 [ -f "$RALPH_CONFIG" ] && . "$RALPH_CONFIG"
+
+# A project's settings live in its workspace, so that has to be settled first.
+RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
+RALPH_PROJECT_CONFIG=""
+
+# RALPH_BUILD_ARGS is split like a shell and spliced into `docker build` on
+# the host, where a flag needs no metacharacter to reach outside the build:
+# --iidfile truncates the file it names, --output type=local,dest=... writes
+# the image tree anywhere the user can write, --secret src=... reads a host
+# file in. A project gets --build-arg, which is what the setting is for, and
+# nothing else.
+only_build_args() {
+  local a expect=flag
+  set -f
+  # shellcheck disable=SC2086  # splitting like `docker build` will is the point
+  set -- $1
+  set +f
+  for a in "$@"; do
+    if [ "$expect" = value ]; then expect=flag; continue; fi
+    case "$a" in
+      --build-arg=?*) ;;
+      --build-arg)    expect=value ;;
+      *)              return 1 ;;
+    esac
+  done
+  [ "$expect" = flag ]
+}
+
+# .ralph/config.env is PARSED, never sourced. It sits in the workspace, which
+# in direct mode is a tree the agent itself can write, and sourcing it would
+# run that tree's shell code on the host as you. Every line is NAME=value;
+# any other line, any name outside RALPH_PROJECT_SETTABLE and any value that
+# could carry a command is named in a warning and skipped.
+load_project_settings() {
+  local file="$RALPH_WORKSPACE/.ralph/config.env" line name value
+  [ -f "$file" ] || return 0
+  RALPH_PROJECT_CONFIG="$file"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in
+      *=*) name="${line%%=*}"; value="${line#*=}" ;;
+      *)   warn "$file: not NAME=value, ignoring: $line"; continue ;;
+    esac
+    # Trailing blanks, and the stray CR a Windows editor leaves behind.
+    name="${name%"${name##*[![:space:]]}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    # One layer of quotes, the way a shell would take it off.
+    case "$value" in
+      \"*\") value="${value#\"}"; value="${value%\"}" ;;
+      \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    case " $RALPH_PROJECT_SETTABLE " in
+      *" $name "*) : ;;
+      *) warn "$file: $name is not a project setting -- ignored"; continue ;;
+    esac
+    # RALPH_BUILD_ARGS reaches an eval and the path lists reach docker, and
+    # this file is the one input that arrives with somebody else's repository.
+    # A value that could run something is refused outright rather than quoted
+    # and hoped about.
+    case "$value" in
+      *'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*\\*)
+        warn "$file: $name contains shell metacharacters -- ignored"; continue ;;
+    esac
+    if [ "$name" = RALPH_BUILD_ARGS ] && ! only_build_args "$value"; then
+      warn "$file: RALPH_BUILD_ARGS may only pass --build-arg -- ignored"; continue
+    fi
+    case " $_env_given " in
+      *" $name "*) continue ;;
+    esac
+    # A loop limit is kept until the defaults are in, so clamp_project_limits
+    # has something to compare it against.
+    case " $RALPH_PROJECT_LIMITS " in
+      *" $name "*) _project_limits="$_project_limits $name=$value"; continue ;;
+    esac
+    eval "$name=\$value"
+  done < "$file"
+}
+load_project_settings
 
 RALPH_IMAGE="${RALPH_IMAGE:-ralph-sandbox}"
 RALPH_PROXY_IMAGE="${RALPH_PROXY_IMAGE:-ralph-proxy}"
 RALPH_HOME_VOLUME="${RALPH_HOME_VOLUME:-ralph-home}"
-RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
 RALPH_AGENT_CMD_SET="${RALPH_AGENT_CMD+1}"
 RALPH_AGENT_CMD="${RALPH_AGENT_CMD:-claude --dangerously-skip-permissions}"
 
@@ -67,6 +189,39 @@ RALPH_LOOP_FAILS="${RALPH_LOOP_FAILS:-2}"
 # for an unattended loop to achieve nothing.
 RALPH_LOOP_REPEAT="${RALPH_LOOP_REPEAT:-3}"
 
+# Is the value a project asked for at least as strict as the one in effect?
+# Smaller halts sooner for all four: loop.sh compares each counter with -ge,
+# so even 0 is a limit and not an off switch. RALPH_LOOP_MAX is the exception,
+# where 0 means no cap at all and so is looser than any number a project could
+# name.
+limit_is_stricter() {
+  local name="$1" want="$2" have="$3"
+  if [ "$name" = RALPH_LOOP_MAX ]; then
+    [ "$want" = 0 ] && return 1
+    [ "$have" = 0 ] && return 0
+  fi
+  [ "$want" -le "$have" ]
+}
+
+# Now that the defaults are in, let the project tighten them.
+clamp_project_limits() {
+  local pair name want have
+  for pair in $_project_limits; do
+    name="${pair%%=*}"; want="${pair#*=}"
+    eval "have=\$$name"
+    case "$want" in
+      ''|*[!0-9]*)
+        warn "$RALPH_PROJECT_CONFIG: $name must be a whole number -- ignored"; continue ;;
+    esac
+    if limit_is_stricter "$name" "$want" "$have"; then
+      eval "$name=\$want"
+    else
+      warn "$RALPH_PROJECT_CONFIG: a project may only lower $name -- ignored (in effect: $have)"
+    fi
+  done
+}
+clamp_project_limits
+
 # The orchestrator routes and records; the subagents think. Its model is set
 # here because it is the session `ralph loop` starts. The other three live in
 # the project's .claude/agents/*.md -- see `ralph model`.
@@ -92,6 +247,25 @@ RALPH_NOTIFY_ON="${RALPH_NOTIFY_ON:-always}"
 #   none   -- no host filesystem at all
 RALPH_MODE="${RALPH_MODE:-direct}"
 
+# Directories the sandbox keeps its own copy of, workspace-relative and
+# separated by spaces. In direct mode the container edits the host's tree, so
+# a directory of compiled dependencies -- node_modules, .venv, target -- ends
+# up shared between a host that may be macOS and a container that is always
+# Linux, and neither can run the other's binaries: whichever installs last
+# breaks the other. Each path here gets a Docker volume of its own mounted
+# over it. Globs are expanded against the workspace, so one line covers a
+# monorepo:
+#   RALPH_ISOLATE="node_modules packages/*/node_modules"
+RALPH_ISOLATE="${RALPH_ISOLATE:-}"
+
+# Files the agent must not read, workspace-relative and separated by spaces.
+# Each one is mounted over with an empty file, so a .env full of live
+# credentials reads as nothing inside the sandbox while the host keeps its
+# copy. Globs are expanded against the workspace:
+#   RALPH_MASK=".env .env.local"
+# This closes one hole; it is not a secret boundary. See docs/security.md.
+RALPH_MASK="${RALPH_MASK:-}"
+
 # Deny-by-default egress through the proxy sidecar.
 RALPH_NETWORK_POLICY="${RALPH_NETWORK_POLICY:-on}"
 RALPH_ALLOWLIST="${RALPH_ALLOWLIST:-$_cfg_home/allowlist}"
@@ -116,9 +290,12 @@ RALPH_MOUNT_GITCONFIG="${RALPH_MOUNT_GITCONFIG:-1}"
 RALPH_MOUNT_SSH="${RALPH_MOUNT_SSH:-0}"
 RALPH_DOCKER_ARGS="${RALPH_DOCKER_ARGS:-}"
 
-die()  { printf 'ralph: %s\n' "$*" >&2; exit 1; }
-info() { printf '\033[2m==> %s\033[0m\n' "$*" >&2; }
-warn() { printf '\033[33mralph: %s\033[0m\n' "$*" >&2; }
+# Extra `docker build` arguments, kept here so that `ralph update` does not
+# forget the toolchain `ralph build` was given. An image that quietly loses
+# the project's package manager halfway through a run is a long way from an
+# obvious failure. Split like a shell would, same as RALPH_DOCKER_ARGS:
+#   RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=pnpm"
+RALPH_BUILD_ARGS="${RALPH_BUILD_ARGS:-}"
 
 command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
 
@@ -205,6 +382,110 @@ ws_volume_name() {
     none) printf 'ralph-box-%s' "$(project_slug)" ;;
     *)    printf 'ralph-ws-%s'  "$(project_slug)" ;;
   esac
+}
+
+# Workspace-relative and nothing else: an absolute path or a .. escape would
+# put a mount somewhere the caller never meant, and these lists can arrive
+# from a project's own config.env.
+check_ws_path() {
+  case "$1" in
+    '')   die "$2: empty path" ;;
+    /*)   die "$2: '$1' must be relative to the workspace" ;;
+    *..*) die "$2: '$1' must not contain .." ;;
+  esac
+}
+
+# Expand globs against the workspace, into _ws_paths. A global array rather
+# than stdout because every caller would otherwise read it through a process
+# substitution, where check_ws_path's die exits that subshell alone: the bad
+# path gets named and the run starts anyway, carrying the entries that came
+# before it and nothing to say the rest were dropped.
+#
+# A literal entry survives not existing yet -- node_modules on a fresh clone
+# is exactly when isolating it matters -- while a glob can only ever match
+# what is already there. Pass `existing` for a list that is mounted over file
+# by file: Docker creates a bind source it cannot find, so an unconditional
+# RALPH_MASK leaves an empty .env.local behind in the user's own workspace.
+_ws_paths=()
+expand_ws_paths() {
+  local list="$1" label="$2" only_existing="${3:-}" p hit
+  _ws_paths=()
+  # Globbing off while the list is split: with it on, word splitting also
+  # expands each entry against the CALLER's directory, and a pattern that
+  # happens to match something there arrives below as a literal that never
+  # reaches the workspace at all -- `ralph` run from a directory holding its
+  # own .env.foo would mask that name and leave the workspace's
+  # .env.production readable.
+  set -f
+  # shellcheck disable=SC2086  # splitting the list is the point
+  set -- $list
+  set +f
+  for p in "$@"; do
+    check_ws_path "$p" "$label"
+    case "$p" in
+      *[*?]*)
+        # Globbing is the point of this loop.
+        # shellcheck disable=SC2231
+        for hit in "$RALPH_WORKSPACE"/$p; do
+          [ -e "$hit" ] || continue
+          _ws_paths+=("${hit#"$RALPH_WORKSPACE"/}")
+        done
+        ;;
+      *)
+        [ -z "$only_existing" ] || [ -e "$RALPH_WORKSPACE/$p" ] || continue
+        _ws_paths+=("$p")
+        ;;
+    esac
+  done
+}
+
+# One volume per workspace and path, so two checkouts of the same repo, or two
+# projects that each have a node_modules, never end up sharing one.
+isolate_volume_name() {
+  printf 'ralph-iso-%s-%s' "$(project_slug)" \
+    "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9_.-' '-')"
+}
+
+# A fresh volume belongs to root and the sandbox is an unprivileged user, so
+# without the chown the project's first install dies on "permission denied".
+# The ids come from the image rather than a constant because on Linux `ralph
+# build` bakes the host user's into it.
+_sandbox_ids=""
+sandbox_ids() {
+  if [ -z "$_sandbox_ids" ]; then
+    _sandbox_ids="$(docker run --rm --entrypoint sh "$RALPH_IMAGE" \
+                      -c 'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null)"
+    [ -n "$_sandbox_ids" ] || _sandbox_ids="1000:1000"
+  fi
+  printf '%s' "$_sandbox_ids"
+}
+
+isolate_prepare() {
+  local vol="$1"
+  volume_exists "$vol" && return 0
+  docker volume create "$vol" >/dev/null
+  docker run --rm -u 0:0 -v "$vol:/v" --entrypoint chown "$RALPH_IMAGE" \
+    "$(sandbox_ids)" /v >/dev/null
+  info "$vol created for $2"
+}
+
+# What a masked file is replaced with. A plain empty file, not /dev/null: a
+# library that stats .env before reading it should find a regular file, and a
+# character device is not one. Mode 444 because there is nothing in it to
+# protect, and an unreadable file would be an error where an empty one is the
+# answer.
+RALPH_EMPTY_FILE=""
+mask_source() {
+  if [ -z "$RALPH_EMPTY_FILE" ]; then
+    local dir="$_data_home/run"
+    mkdir -p "$dir" && chmod 700 "$dir"
+    RALPH_EMPTY_FILE="$dir/empty"
+    # Mode 444 left by an earlier run would make the truncate fail.
+    [ -e "$RALPH_EMPTY_FILE" ] && chmod 600 "$RALPH_EMPTY_FILE"
+    : > "$RALPH_EMPTY_FILE"
+    chmod 444 "$RALPH_EMPTY_FILE"
+  fi
+  printf '%s' "$RALPH_EMPTY_FILE"
 }
 
 # API keys go into the sandbox through a file mounted read-only, not through
@@ -295,6 +576,43 @@ proxy_down() {
   fi
 }
 
+# Add the rules in a file that the policy does not have yet, touching nothing
+# that is already there: the allowlist belongs to the user, and a merge that
+# reorders or drops their own lines would be a worse trade than a stale one.
+# Shared by `policy sync` and by a preset's extra hosts.
+# A running proxy reads the allowlist at startup, so a change needs a restart;
+# a proxy that is not running needs nothing. Written as a function with an
+# explicit exit status because this is the last thing each policy command
+# does: as a trailing `proxy_running && ...` it made `ralph policy sync` and
+# `ralph policy reset` exit 1 on any machine where the proxy happened to be
+# down, which is most of them.
+policy_reload() {
+  proxy_running || return 0
+  info "restarting proxy to apply policy"
+  docker restart "$RALPH_PROXY_NAME" >/dev/null
+}
+
+policy_merge() {
+  local src="$1" label="$2" nothing="$3" added=0 rule
+  ensure_allowlist
+  [ -f "$src" ] || return 0
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    grep -qxF "$rule" "$RALPH_ALLOWLIST" && continue
+    [ "$added" -eq 0 ] && printf '\n# --- added by %s on %s ---\n' \
+      "$label" "$(date -u +%Y-%m-%d)" >> "$RALPH_ALLOWLIST"
+    printf '%s\n' "$rule" >> "$RALPH_ALLOWLIST"
+    info "added $rule"
+    added=$((added + 1))
+  done < <(grep -vE '^\s*(#|$)' "$src")
+  if [ "$added" -eq 0 ]; then
+    info "$nothing"
+  else
+    info "$added rule(s) added to $RALPH_ALLOWLIST"
+    policy_reload
+  fi
+}
+
 cmd_policy() {
   case "${1:-ls}" in
     ls)
@@ -306,37 +624,21 @@ cmd_policy() {
     edit)
       ensure_allowlist
       "${EDITOR:-vi}" "$RALPH_ALLOWLIST"
-      proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
+      policy_reload
       ;;
     reset)
       mkdir -p "$(dirname "$RALPH_ALLOWLIST")"
       cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ALLOWLIST"
       info "policy reset to defaults"
-      proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
+      policy_reload
       ;;
     sync)
       # An allowlist is seeded once and then belongs to the user, so shipping a
       # new default does not reach an existing install. That is usually right,
       # and exactly wrong for a host a new feature needs: the codex fallback
-      # would fail at the far end of an unattended run. This adds what is
-      # missing and touches nothing that is already there.
-      ensure_allowlist
-      local added=0 rule
-      while IFS= read -r rule; do
-        [ -n "$rule" ] || continue
-        grep -qxF "$rule" "$RALPH_ALLOWLIST" && continue
-        [ "$added" -eq 0 ] && printf '\n# --- added by ralph policy sync on %s ---\n' \
-          "$(date -u +%Y-%m-%d)" >> "$RALPH_ALLOWLIST"
-        printf '%s\n' "$rule" >> "$RALPH_ALLOWLIST"
-        info "added $rule"
-        added=$((added + 1))
-      done < <(grep -vE '^\s*(#|$)' "$RALPH_ROOT/policy/default.allowlist")
-      if [ "$added" -eq 0 ]; then
-        info "policy already has every shipped rule"
-      else
-        info "$added rule(s) added to $RALPH_ALLOWLIST"
-        proxy_running && { info "restarting proxy to apply policy"; docker restart "$RALPH_PROXY_NAME" >/dev/null; }
-      fi
+      # would fail at the far end of an unattended run.
+      policy_merge "$RALPH_ROOT/policy/default.allowlist" "ralph policy sync" \
+        "policy already has every shipped rule"
       ;;
     test)
       local host="${2:-}"
@@ -509,7 +811,16 @@ warn_stale_home() {
 cmd_build() {
   info "building $RALPH_IMAGE"
   local uid_args=() ; while IFS= read -r a; do uid_args+=("$a"); done < <(build_uid_args)
-  docker build ${uid_args[@]+"${uid_args[@]}"} "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+  # Split like a shell would, as RALPH_DOCKER_ARGS is, and placed before "$@"
+  # so a --build-arg typed on the command line still beats a remembered one.
+  local cfg_args=()
+  if [ -n "$RALPH_BUILD_ARGS" ]; then
+    info "with RALPH_BUILD_ARGS: $RALPH_BUILD_ARGS"
+    # shellcheck disable=SC2294
+    eval "cfg_args=($RALPH_BUILD_ARGS)"
+  fi
+  docker build ${uid_args[@]+"${uid_args[@]}"} ${cfg_args[@]+"${cfg_args[@]}"} \
+    "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
   build_proxy
   warn_stale_home
 }
@@ -520,9 +831,17 @@ cmd_update() {
   # The Dockerfile pins both agents so `ralph build` is reproducible; update
   # is the one command that deliberately asks for whatever npm has today.
   # Your own --build-arg comes later on the line and wins.
+  # Placed after the `latest` pair, so a project that pins an agent version in
+  # RALPH_BUILD_ARGS gets the version it asked for.
+  local cfg_args=()
+  if [ -n "$RALPH_BUILD_ARGS" ]; then
+    info "with RALPH_BUILD_ARGS: $RALPH_BUILD_ARGS"
+    # shellcheck disable=SC2294
+    eval "cfg_args=($RALPH_BUILD_ARGS)"
+  fi
   docker build --pull --no-cache ${uid_args[@]+"${uid_args[@]}"} \
     --build-arg CLAUDE_VERSION=latest --build-arg CODEX_VERSION=latest \
-    "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
+    ${cfg_args[@]+"${cfg_args[@]}"} "$@" -t "$RALPH_IMAGE" "$RALPH_ROOT"
   cp "$RALPH_ROOT/policy/default.allowlist" "$RALPH_ROOT/proxy/default.allowlist"
   docker build --pull --no-cache -t "$RALPH_PROXY_IMAGE" "$RALPH_ROOT/proxy"
   proxy_running && docker restart "$RALPH_PROXY_NAME" >/dev/null
@@ -549,18 +868,48 @@ cmd_run() {
 
   # --- workspace mode -----------------------------------------------------
   # Clone and mountless workspaces are different things; keep them apart.
-  local ws_volume
+  local ws_volume iso_path iso_vol mask_path mask_file
   ws_volume="$(ws_volume_name)"
+  if [ -n "$RALPH_ISOLATE" ] && [ "$RALPH_MODE" != "direct" ]; then
+    warn "RALPH_ISOLATE has nothing to do in $RALPH_MODE mode -- that workspace is already the sandbox's own"
+  fi
+  if [ -n "$RALPH_MASK" ] && [ "$RALPH_MODE" = "none" ]; then
+    warn "RALPH_MASK has nothing to do in none mode -- no host file is mounted"
+  fi
   case "$RALPH_MODE" in
     direct)
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
       snapshot_create quiet
       args+=(-v "$RALPH_WORKSPACE:/workspace")
+      # The settings the host just read, mounted back over themselves
+      # read-only. Without this the agent could rewrite its own
+      # .ralph/config.env and the next run would start with whatever it chose
+      # -- nothing masked, no dependency directory of its own.
+      [ -n "$RALPH_PROJECT_CONFIG" ] &&
+        args+=(-v "$RALPH_PROJECT_CONFIG:/workspace/.ralph/config.env:ro")
+      expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE
+      for iso_path in ${_ws_paths[@]+"${_ws_paths[@]}"}; do
+        iso_vol="$(isolate_volume_name "$iso_path")"
+        isolate_prepare "$iso_vol" "$iso_path"
+        args+=(-v "$iso_vol:/workspace/$iso_path")
+      done
+      expand_ws_paths "$RALPH_MASK" RALPH_MASK existing
+      for mask_path in ${_ws_paths[@]+"${_ws_paths[@]}"}; do
+        args+=(-v "$(mask_source):/workspace/$mask_path:ro")
+      done
       ;;
     clone)
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
       volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
       args+=(-v "$RALPH_WORKSPACE:/run/sandbox/source:ro" -v "$ws_volume:/workspace")
+      expand_ws_paths "$RALPH_MASK" RALPH_MASK existing
+      for mask_path in ${_ws_paths[@]+"${_ws_paths[@]}"}; do
+        mask_file="$(mask_source)"
+        # Both ends: the source the private copy is seeded from, and the copy
+        # itself, which may have been seeded before masking was turned on.
+        args+=(-v "$mask_file:/run/sandbox/source/$mask_path:ro")
+        args+=(-v "$mask_file:/workspace/$mask_path:ro")
+      done
       ;;
     none)
       volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
@@ -827,6 +1176,35 @@ cmd_status() {
   printf 'hardened      %s\n' "$RALPH_HARDEN"
   printf 'snapshots     %s  (%s)\n' "$RALPH_SNAPSHOT" "$(snapshot_store)"
   printf 'config        %s%s\n' "$RALPH_CONFIG" "$([ -f "$RALPH_CONFIG" ] || echo '  (none)')"
+  if [ -n "$RALPH_PROJECT_CONFIG" ]; then
+    printf 'project cfg   %s\n' "$RALPH_PROJECT_CONFIG"
+  fi
+  if [ -n "$RALPH_ISOLATE" ]; then
+    if [ "$RALPH_MODE" = "direct" ]; then
+      expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE
+      if [ ${#_ws_paths[@]} -eq 0 ]; then
+        printf 'isolate       nothing in the workspace matches %s\n' "$RALPH_ISOLATE"
+      else
+        printf 'isolate       %s  (sandbox keeps its own)\n' "${_ws_paths[*]}"
+      fi
+    else
+      printf 'isolate       nothing to do in %s mode\n' "$RALPH_MODE"
+    fi
+  fi
+  case "$RALPH_MODE" in
+    direct|clone)
+      expand_ws_paths "$RALPH_MASK" RALPH_MASK existing
+      if [ ${#_ws_paths[@]} -gt 0 ]; then
+        printf 'mask          %s  (empty inside the sandbox)\n' "${_ws_paths[*]}"
+      elif [ -n "$RALPH_MASK" ]; then
+        # Set but masking nothing is worth saying out loud: the list is the
+        # one setting whose whole job is to be in effect before a run starts.
+        printf 'mask          no file in the workspace matches %s\n' "$RALPH_MASK"
+      else
+        printf 'mask          off  (the agent can read every file in the workspace)\n'
+      fi
+      ;;
+  esac
   if image_exists "$RALPH_IMAGE"; then
     printf 'image         %s  %s\n' "$RALPH_IMAGE" \
       "$(docker image inspect "$RALPH_IMAGE" --format '{{.Architecture}}' 2>/dev/null)"
@@ -853,6 +1231,14 @@ cmd_clean() {
       local ws_volume; ws_volume="$(ws_volume_name)"
       if volume_exists "$ws_volume"; then docker volume rm "$ws_volume"
       else info "no sandbox workspace volume for $RALPH_WORKSPACE"; fi
+      # The isolated dependency directories belong to the same workspace, and
+      # a stale one is how a project that changed package manager stays
+      # broken.
+      local iso
+      for iso in $(docker volume ls -q \
+                     --filter "name=^ralph-iso-$(project_slug)-" 2>/dev/null); do
+        docker volume rm "$iso"
+      done
       ;;
     image)
       if image_exists "$RALPH_IMAGE"; then docker image rm "$RALPH_IMAGE"; else info "no image"; fi
@@ -886,37 +1272,238 @@ cmd_proxy() {
 # `init` lays down the PRD, the loop prompt, the shared state files and the
 # orchestrator's three subagents. It runs on the host, not in the sandbox, so
 # you can open PRD.md in your editor before anything starts.
-cmd_init() {
-  case "${1:-}" in
-    ''|--force) : ;;
-    *) die "unknown argument: $1 (expected --force)" ;;
-  esac
-  local force=0
-  [ "${1:-}" = "--force" ] && force=1
-
-  local src="$RALPH_ROOT/templates"
-  [ -d "$src" ] || die "templates not found at $src"
-  [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
-
-  local rel dest created=0 skipped=0
+# Copy a tree into the workspace. Anything already there is left alone unless
+# --force, because `ralph init` is run again on projects that have been worked
+# on. SKIP is a space-separated list of paths a preset has already provided,
+# which the templates must not overwrite even with --force.
+_scaffold_created=0
+_scaffold_skipped=0
+scaffold_tree() {
+  local src="$1" force="$2" skip="${3:- }" rel dest
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
+    case " $skip " in *" $rel "*) continue ;; esac
     dest="$RALPH_WORKSPACE/$rel"
     if [ -e "$dest" ] && [ "$force" -eq 0 ]; then
       printf '  skip    %s\n' "$rel"
-      skipped=$((skipped + 1))
+      _scaffold_skipped=$((_scaffold_skipped + 1))
       continue
     fi
     mkdir -p "$(dirname "$dest")"
     cp "$src/$rel" "$dest"
     printf '  create  %s\n' "$rel"
-    created=$((created + 1))
+    _scaffold_created=$((_scaffold_created + 1))
   done <<EOF
 $(cd "$src" && find . -type f | sed 's|^\./||' | sort)
 EOF
+}
 
-  info "$created file(s) created, $skipped left alone"
-  if [ "$skipped" -gt 0 ] && [ "$force" -eq 0 ]; then
+preset_names() {
+  [ -d "$RALPH_ROOT/presets" ] || return 0
+  (cd "$RALPH_ROOT/presets" \
+     && find . -maxdepth 1 -mindepth 1 -type d | sed 's|^\./||' | sort)
+}
+
+# Which package manager the project uses, decided by its lockfile rather than
+# by what is popular: installing with the wrong one is a wasted iteration, and
+# in a monorepo it is a wasted hour.
+detect_pm() {
+  if   [ -f "$RALPH_WORKSPACE/pnpm-lock.yaml" ];     then printf 'pnpm'
+  elif [ -f "$RALPH_WORKSPACE/yarn.lock" ];          then printf 'yarn'
+  elif [ -f "$RALPH_WORKSPACE/bun.lockb" ];          then printf 'bun'
+  elif [ -f "$RALPH_WORKSPACE/package-lock.json" ];  then printf 'npm'
+  else printf ''
+  fi
+}
+
+# The names in package.json's "scripts" object, one per line. Only that
+# object: a dependency called `lint` is not a script called `lint`, and
+# telling the loop to run a command that does not exist costs an iteration.
+# jq is optional on the host, hence the fallback -- it walks the braces that
+# close the object rather than trusting the file to be pretty-printed.
+pkg_scripts() {
+  local f="$RALPH_WORKSPACE/package.json"
+  [ -f "$f" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'try (.scripts | keys[]) catch empty' "$f" 2>/dev/null
+    return 0
+  fi
+  tr -d '\n' < "$f" | awk '
+    {
+      i = index($0, "\"scripts\"")
+      if (i == 0) exit
+      s = substr($0, i)
+      s = substr(s, index(s, "{") + 1)
+      depth = 1
+      body = ""
+      for (n = 1; n <= length(s); n++) {
+        c = substr(s, n, 1)
+        if (c == "{") depth++
+        else if (c == "}") { depth--; if (depth == 0) break }
+        body = body c
+      }
+      count = split(body, pair, ",")
+      for (k = 1; k <= count; k++) {
+        if (match(pair[k], /"[^"]+"[ \t]*:/)) {
+          key = substr(pair[k], RSTART + 1)
+          print substr(key, 1, index(key, "\"") - 1)
+        }
+      }
+    }'
+}
+has_script() { pkg_scripts | grep -qxF "$1"; }
+
+# The first of these script names the project actually has.
+first_script() {
+  local n
+  for n in "$@"; do
+    if has_script "$n"; then printf '%s' "$n"; return 0; fi
+  done
+  return 1
+}
+
+# The scaffolded CLAUDE.md ships a placeholder where the project's commands
+# belong, and every agent in the loop reads that section every iteration. A
+# Node project already states its commands in package.json, so fill them in
+# rather than leave the loop to guess.
+preset_fill_commands() {
+  local cm="$RALPH_WORKSPACE/CLAUDE.md" pm install block name
+  [ -f "$cm" ] || return 0
+  grep -q '# fill in' "$cm" || return 0
+  pm="$(detect_pm)"
+  [ -n "$pm" ] || return 0
+
+  case "$pm" in
+    pnpm) install="pnpm install --frozen-lockfile" ;;
+    npm)  install="npm ci" ;;
+    *)    install="$pm install" ;;
+  esac
+  block="$install"
+  for name in \
+      "$(first_script typecheck type-check tsc || true)" \
+      "$(first_script test:run test:ci test || true)" \
+      "$(first_script lint || true)"; do
+    [ -n "$name" ] && block="$block
+$pm run $name"
+  done
+  if has_script build; then
+    block="$block
+# $pm run build   # add once you have seen it pass inside the sandbox"
+  fi
+
+  # Rewritten through a temp file: `sed -i` takes different arguments on macOS
+  # and on Linux, and `awk -v` will not carry a multi-line value on either.
+  local tmp line
+  tmp="$(mktemp)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '# fill in'*) printf '%s\n' "$block" ;;
+      *)            printf '%s\n' "$line" ;;
+    esac
+  done < "$cm" > "$tmp"
+  mv "$tmp" "$cm"
+  printf '  fill    CLAUDE.md  (commands from package.json)\n'
+}
+
+# A preset's package manager has to be in the image, and `ralph update` only
+# keeps it if it is written down. The version comes from package.json's
+# packageManager field when it has one, so the sandbox and the host agree.
+preset_fill_config() {
+  local cfg="$RALPH_WORKSPACE/.ralph/config.env" pm ver
+  [ -f "$cfg" ] || return 0
+  grep -q 'RALPH_BUILD_ARGS' "$cfg" && return 0
+  pm="$(detect_pm)"
+  [ -n "$pm" ] || return 0
+  if [ "$pm" = "npm" ]; then
+    cat >> "$cfg" <<'EOF'
+
+# npm is already in the sandbox image, so there is nothing to add here.
+EOF
+    return 0
+  fi
+  ver="$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+           "$RALPH_WORKSPACE/package.json" 2>/dev/null | head -1)"
+  case "$ver" in "$pm@"*) : ;; *) ver="$pm" ;; esac
+  {
+    cat <<'EOF'
+
+# The image ships npm only, and `ralph update` rebuilds it from scratch:
+# without this line the sandbox loses the project's package manager halfway
+# through a run, which looks like a broken project rather than a lost flag.
+EOF
+    printf 'RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=%s"\n' "$ver"
+  } >> "$cfg"
+  printf '  fill    .ralph/config.env  (%s for the image)\n' "$ver"
+}
+
+# The stack's rules are one file, so the two entry points cannot drift from
+# each other. CLAUDE.md imports it; AGENTS.md is told to read it, because
+# Codex does not follow imports.
+preset_link_rules() {
+  [ -f "$RALPH_WORKSPACE/.ralph/rules.md" ] || return 0
+  local f="$RALPH_WORKSPACE/CLAUDE.md"
+  if [ -f "$f" ] && ! grep -q '.ralph/rules.md' "$f"; then
+    printf '\n## Stack rules\n\n@.ralph/rules.md\n' >> "$f"
+    printf '  link    CLAUDE.md -> .ralph/rules.md\n'
+  fi
+  f="$RALPH_WORKSPACE/AGENTS.md"
+  if [ -f "$f" ] && ! grep -q '.ralph/rules.md' "$f"; then
+    cat >> "$f" <<'EOF'
+
+## Stack rules
+
+**Read `.ralph/rules.md` before you touch code.** It holds the rules for this
+stack: what the sandbox cannot do, and the mistakes that cost the most here.
+It is the same file `CLAUDE.md` imports, so the two cannot drift.
+EOF
+    printf '  link    AGENTS.md -> .ralph/rules.md\n'
+  fi
+}
+
+cmd_init() {
+  local force=0 preset="" dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force)    force=1; shift ;;
+      --preset)   [ $# -ge 2 ] || die "--preset needs a name (have: $(preset_names | tr '\n' ' '))"
+                  preset="$2"; shift 2 ;;
+      --preset=*) preset="${1#*=}"; shift ;;
+      *) die "unknown argument: $1 (expected --force or --preset NAME)" ;;
+    esac
+  done
+
+  local src="$RALPH_ROOT/templates"
+  [ -d "$src" ] || die "templates not found at $src"
+  [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
+
+  if [ -n "$preset" ]; then
+    case "$preset" in
+      */*|.*) die "bad preset name: $preset" ;;
+    esac
+    dir="$RALPH_ROOT/presets/$preset"
+    [ -d "$dir" ] || die "unknown preset '$preset' (have: $(preset_names | tr '\n' ' '))"
+  fi
+
+  # The preset goes down first and the templates fill in the rest, so a file
+  # the preset has its own version of -- PRD.md -- is the one that lands.
+  local preset_rels=""
+  if [ -n "$dir" ] && [ -d "$dir/files" ]; then
+    info "preset: $preset"
+    preset_rels="$(cd "$dir/files" && find . -type f | sed 's|^\./||' | tr '\n' ' ')"
+    scaffold_tree "$dir/files" "$force"
+  fi
+  scaffold_tree "$src" "$force" "$preset_rels"
+
+  if [ -n "$dir" ]; then
+    preset_fill_commands
+    preset_fill_config
+    preset_link_rules
+    policy_merge "$dir/allowlist" "the $preset preset" \
+      "policy already has every host the $preset preset needs"
+  fi
+
+  info "$_scaffold_created file(s) created, $_scaffold_skipped left alone"
+  if [ "$_scaffold_skipped" -gt 0 ] && [ "$force" -eq 0 ]; then
     info "'ralph init --force' would overwrite them"
   fi
   cat <<'__NEXT__'
@@ -927,6 +1514,15 @@ Next:
   2. ralph loop
 
 __NEXT__
+  if [ -n "$dir" ]; then
+    cat <<'__PRESET_NEXT__'
+The preset also wrote .ralph/config.env, which `ralph` reads on the host. If
+it added a package manager for the image, run `ralph build` before the loop.
+`ralph status` shows what is in effect and `ralph policy ls` what is now
+reachable.
+
+__PRESET_NEXT__
+  fi
 }
 
 # `loop` is `run` with a different entrypoint: the agent is driven by
@@ -1127,6 +1723,7 @@ COMMANDS
   ralph [run] [args...]   Launch the agent over the current directory (default)
   ralph login [provider]  Sign the sandbox in to anthropic or codex (do this first)
   ralph init [--force]    Scaffold the Ralph loop: PRD, prompts, state, subagents
+  ralph init --preset NAME  ...and a stack's rules, settings and egress hosts
   ralph loop [N]          Run until the PRD is done (N caps the iterations)
   ralph model [role model]  Show, or change, the model behind each role
   ralph shell [args...]   Open a shell in the sandbox instead
@@ -1208,6 +1805,13 @@ KEY SETTINGS  (env vars, or ~/.config/ralph/config.env)
   RALPH_NOTIFY_ON         always | problem             [always]
   RALPH_MEMORY RALPH_CPUS RALPH_PIDS_LIMIT
   RALPH_MOUNT_GITCONFIG   [1]      RALPH_MOUNT_SSH     [0]
+  RALPH_ISOLATE           dependency dirs the sandbox keeps its own copy of
+  RALPH_MASK              workspace files that read empty inside the sandbox
+  RALPH_BUILD_ARGS        docker build args kept across build and update
+
+  A project can carry its own settings in .ralph/config.env, which travels
+  with the repository. Only the convenience settings may come from there --
+  never the egress policy, the workspace mode or docker arguments.
 
 Run `ralph status` to see what is actually in effect.
 __HELP__

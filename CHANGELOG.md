@@ -7,6 +7,35 @@ version` prints the release you are running.
 
 ## [Unreleased]
 
+### Added
+
+- `ralph init --preset NAME`: a stack's setup in one command -- the rules
+  every agent in the loop reads, the project's build and test commands read
+  out of `package.json`, the settings the sandbox needs, a PRD skeleton, and
+  the hosts the stack reaches at build time merged into the egress policy. A
+  preset can only ask for what a project may set, so it cannot widen the
+  sandbox.
+- A `shopify` preset, for embedded admin apps on Remix or React Router with
+  Prisma and Postgres: offline migrations, shop scoping, webhooks, the Admin
+  API, billing, extensions and Functions.
+- `RALPH_BUILD_ARGS`: `docker build` arguments remembered in a config file, so
+  `ralph update` keeps the toolchain `ralph build` was given instead of
+  silently dropping it.
+- `RALPH_MASK`: workspace files mounted over with an empty read-only file, so
+  a `.env` of live credentials reads as nothing inside the sandbox while the
+  host keeps its copy. Covers both ends of a `clone`.
+- `RALPH_ISOLATE`: dependency directories the sandbox keeps its own copy of,
+  so a Linux container and a macOS host stop overwriting each other's
+  compiled binaries in `direct` mode. Globs are expanded against the
+  workspace; `ralph clean workspace` removes the volumes.
+- A project can carry its own ralph settings in `.ralph/config.env`, committed
+  alongside the code, so a checkout runs the same way on every machine. Only
+  the convenience settings may come from there; the egress policy, the
+  workspace mode, the image, docker arguments and the spend ceiling stay with
+  the person running `ralph`. The file is parsed rather than sourced, and in
+  `direct` mode it is mounted back read-only so the agent cannot rewrite the
+  settings it runs under.
+
 ## [0.1.0] - 2026-10-01
 
 The first tagged release.

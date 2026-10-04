@@ -55,6 +55,23 @@
 ^objects\.githubusercontent\.com$
 ^raw\.githubusercontent\.com$
 
+# --- Optional: hosts a stack needs at build or test time ---
+# All commented out. `ralph policy sync` only ever adds uncommented rules, so
+# nothing here turns itself on. Uncomment what your project actually fetches,
+# then check it with `ralph policy test HOST`. `ralph init --preset` adds the
+# ones its stack needs, and says which.
+# Prisma downloads a query engine built for the sandbox's platform, on every
+# `prisma generate`.
+#^binaries\.prisma\.sh$
+# Playwright browser bundles.
+#^cdn\.playwright\.dev$
+# Go modules and the checksum database.
+#^proxy\.golang\.org$
+#^sum\.golang\.org$
+# Rust crates.
+#^index\.crates\.io$
+#^static\.crates\.io$
+
 # --- OS packages (needed to install things inside the sandbox) ---
 ^archive\.ubuntu\.com$
 ^security\.ubuntu\.com$
