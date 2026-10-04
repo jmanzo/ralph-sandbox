@@ -51,6 +51,7 @@ It is **not** protecting against:
 | Credentials | Logins live in a Docker volume; host API keys arrive through a mode-600 file, not `-e`; webhooks and bot tokens never enter at all | CI: "Slack, Discord and Telegram each get the end-of-run message" (posted from the host) |
 | Workspace secrets | `RALPH_MASK` mounts an empty read-only file over each listed path, in `direct` mode and over both ends of a `clone` | CI: "Masked files read empty inside the sandbox, in both modes" |
 | Spend | Stall, repeated-failure, three-strikes and spend-ceiling guardrails in `loop.sh` | CI: the `loop` job |
+| Project settings | `.ralph/config.env` is parsed rather than sourced and only the convenience settings are read; the four loop limits on that list may only be tightened, and a project's `RALPH_BUILD_ARGS` may pass `--build-arg` and nothing else | CI: "A project's own settings cannot loosen the sandbox", "A project may tighten a loop limit but never loosen one" |
 | Supply chain | Base images pinned by digest, agents by version, actions by SHA; no scripts piped into bash at build time; Dependabot moves the pins | -- |
 
 The [README](../README.md) describes each of these from the user's side.

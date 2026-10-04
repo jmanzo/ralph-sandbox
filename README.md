@@ -194,10 +194,10 @@ RALPH_BUILD_ARGS="--build-arg EXTRA_NPM_PACKAGES=pnpm"
 
 A project may only set the convenience settings. The egress policy, the
 workspace mode, the image, docker arguments and the spend ceiling are not on
-that list, so cloning a repository and running `ralph` in it cannot loosen the
-sandbox or spend your money; in `direct` mode the file is mounted back
-read-only so the agent cannot edit the settings its next run would use. CI
-proves both.
+that list, and the four loop limits that are on it may only be made stricter,
+so cloning a repository and running `ralph` in it cannot loosen the sandbox or
+spend your money; in `direct` mode the file is mounted back read-only so the
+agent cannot edit the settings its next run would use. CI proves both.
 
 Or get the whole setup for a stack in one command:
 

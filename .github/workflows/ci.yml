@@ -195,6 +195,77 @@ jobs:
           fi
           test ! -e /tmp/ws/.env.local
 
+      - name: A project may tighten a loop limit but never loosen one
+        run: |
+          mkdir -p /tmp/fakebin
+          cat > /tmp/fakebin/docker <<'SH'
+          #!/usr/bin/env bash
+          echo "docker $*" >> /tmp/docker-calls
+          exit 0
+          SH
+          chmod +x /tmp/fakebin/docker
+
+          rm -rf /tmp/limits && mkdir -p /tmp/limits/.ralph
+          echo go > /tmp/limits/.ralph/PROMPT.md
+          echo '# PRD' > /tmp/limits/PRD.md
+          echo canary > /tmp/canary
+          cat > /tmp/limits/.ralph/config.env <<'EOF'
+          RALPH_LOOP_MAX=0
+          RALPH_LOOP_STALL=99999
+          RALPH_LOOP_FAILS=99999
+          RALPH_LOOP_REPEAT=99999
+          RALPH_BUILD_ARGS=--iidfile /tmp/canary
+          EOF
+
+          rm -f /tmp/docker-calls
+          out=$(PATH=/tmp/fakebin:$PATH RALPH_WORKSPACE=/tmp/limits \
+                RALPH_NETWORK_POLICY=off ./ralph loop 2>&1 || true)
+          echo "$out"
+          # Named one by one, and the defaults are what reaches the driver.
+          for v in RALPH_LOOP_MAX RALPH_LOOP_STALL RALPH_LOOP_FAILS RALPH_LOOP_REPEAT; do
+            echo "$out" | grep -q "may only lower $v"
+          done
+          grep -o 'RALPH_LOOP_[A-Z]*=[0-9]*' /tmp/docker-calls | sort -u
+          grep -q 'RALPH_LOOP_STALL=3' /tmp/docker-calls
+          grep -q 'RALPH_LOOP_FAILS=2' /tmp/docker-calls
+          grep -q 'RALPH_LOOP_REPEAT=3' /tmp/docker-calls
+          if grep -qE 'RALPH_LOOP_(STALL|FAILS|REPEAT)=99999' /tmp/docker-calls; then
+            echo "a project turned off a guardrail"; exit 1
+          fi
+
+          # RALPH_BUILD_ARGS reaches `docker build` on the host, where a flag
+          # needs no metacharacter to write outside the build.
+          echo "$out" | grep -q "RALPH_BUILD_ARGS may only pass --build-arg"
+          rm -f /tmp/docker-calls
+          PATH=/tmp/fakebin:$PATH RALPH_WORKSPACE=/tmp/limits ./ralph build 2>&1 || true
+          if grep -q 'iidfile' /tmp/docker-calls; then
+            echo "a project passed its own docker build flag"; exit 1
+          fi
+          test "$(cat /tmp/canary)" = canary
+
+          # Tighter is a project's to choose, and the command line still wins.
+          cat > /tmp/limits/.ralph/config.env <<'EOF'
+          RALPH_LOOP_MAX=20
+          RALPH_LOOP_STALL=2
+          RALPH_BUILD_ARGS=--build-arg EXTRA_NPM_PACKAGES=pnpm
+          EOF
+          rm -f /tmp/docker-calls
+          out=$(PATH=/tmp/fakebin:$PATH RALPH_WORKSPACE=/tmp/limits \
+                RALPH_NETWORK_POLICY=off ./ralph loop 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -q "may only lower"; then
+            echo "a project could not tighten a limit"; exit 1
+          fi
+          grep -q 'RALPH_LOOP_STALL=2' /tmp/docker-calls
+          # The cap is the driver's argument, not one of its env vars.
+          grep -q 'ralph-loop 20' /tmp/docker-calls
+          out=$(PATH=/tmp/fakebin:$PATH RALPH_WORKSPACE=/tmp/limits \
+                RALPH_LOOP_STALL=9 ./ralph status 2>&1)
+          echo "$out"
+          if echo "$out" | grep -q "may only lower"; then
+            echo "a value given on the command line was clamped"; exit 1
+          fi
+
   loop:
     runs-on: ubuntu-latest
     steps:

@@ -153,6 +153,24 @@ or to spend your money. For the same reason the file is parsed rather than
 sourced, and a value containing shell metacharacters is refused instead of
 quoted and hoped about.
 
+Two of the settings a project may name are narrowed rather than taken as
+given, for the same reason:
+
+- **The four loop limits** -- `RALPH_LOOP_MAX`, `RALPH_LOOP_STALL`,
+  `RALPH_LOOP_FAILS` and `RALPH_LOOP_REPEAT` -- are the guardrails that stop
+  an unattended run, so a project may only make one **stricter** than what is
+  already in effect. `RALPH_LOOP_MAX=20` in a project that would otherwise
+  run uncapped is honoured; `RALPH_LOOP_STALL=99999` is named in a warning
+  and ignored. A smaller number halts sooner for all four, and
+  `RALPH_LOOP_MAX=0` means no cap at all, so it is the loosest value there is
+  and a project cannot ask for it.
+- **`RALPH_BUILD_ARGS`** from a project may pass `--build-arg` and nothing
+  else. It is spliced into `docker build` on the host, where a flag needs no
+  shell metacharacter to reach outside the build: `--iidfile` truncates the
+  file it names, `--output type=local,dest=...` writes the image tree
+  anywhere you can write. Your own `~/.config/ralph/config.env` is not
+  restricted this way; a repository you just cloned is.
+
 In `direct` mode `ralph` mounts the file back over itself read-only, so the
 agent cannot change the settings its next run will start with.
 

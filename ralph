@@ -41,12 +41,26 @@ RALPH_CONFIG="${RALPH_CONFIG:-$_cfg_home/config.env}"
 # gets mounted are all absent from this list on purpose: a repository you have
 # only just cloned must not be able to loosen the sandbox it is about to run
 # inside.
+#
+# The four loop limits are on the list but clamped, not taken as given: see
+# RALPH_PROJECT_LIMITS below. RALPH_BUILD_ARGS is on it narrowed to
+# --build-arg: see only_build_args.
 RALPH_PROJECT_SETTABLE="RALPH_ISOLATE RALPH_MASK RALPH_BUILD_ARGS"
 RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_MAX RALPH_LOOP_SLEEP"
 RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_STALL RALPH_LOOP_FAILS"
 RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_LOOP_REPEAT RALPH_FALLBACK"
 RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_MODEL_ORCHESTRATOR"
 RALPH_PROJECT_SETTABLE="$RALPH_PROJECT_SETTABLE RALPH_CODEX_MODEL RALPH_CODEX_EFFORT"
+
+# The subset of that list a project may only make STRICTER. Each one is a
+# guardrail that stops an unattended loop spending money -- loop.sh's
+# iteration cap, stall check, three-strikes and repeated-failure check -- so a
+# project saying "cap me at 20 iterations" is useful while a project saying
+# "never stop" would hand a cloned repository the wallet. The values arrive
+# before the defaults are in, so they are stashed and applied by
+# clamp_project_limits.
+RALPH_PROJECT_LIMITS="RALPH_LOOP_MAX RALPH_LOOP_STALL RALPH_LOOP_FAILS RALPH_LOOP_REPEAT"
+_project_limits=""
 
 # A value typed on the command line outranks both config files, so note which
 # of these names the environment already carried before either one is read.
@@ -61,6 +75,29 @@ done
 # A project's settings live in its workspace, so that has to be settled first.
 RALPH_WORKSPACE="${RALPH_WORKSPACE:-$PWD}"
 RALPH_PROJECT_CONFIG=""
+
+# RALPH_BUILD_ARGS is split like a shell and spliced into `docker build` on
+# the host, where a flag needs no metacharacter to reach outside the build:
+# --iidfile truncates the file it names, --output type=local,dest=... writes
+# the image tree anywhere the user can write, --secret src=... reads a host
+# file in. A project gets --build-arg, which is what the setting is for, and
+# nothing else.
+only_build_args() {
+  local a expect=flag
+  set -f
+  # shellcheck disable=SC2086  # splitting like `docker build` will is the point
+  set -- $1
+  set +f
+  for a in "$@"; do
+    if [ "$expect" = value ]; then expect=flag; continue; fi
+    case "$a" in
+      --build-arg=?*) ;;
+      --build-arg)    expect=value ;;
+      *)              return 1 ;;
+    esac
+  done
+  [ "$expect" = flag ]
+}
 
 # .ralph/config.env is PARSED, never sourced. It sits in the workspace, which
 # in direct mode is a tree the agent itself can write, and sourcing it would
@@ -98,8 +135,16 @@ load_project_settings() {
       *'$'*|*'`'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*|*\\*)
         warn "$file: $name contains shell metacharacters -- ignored"; continue ;;
     esac
+    if [ "$name" = RALPH_BUILD_ARGS ] && ! only_build_args "$value"; then
+      warn "$file: RALPH_BUILD_ARGS may only pass --build-arg -- ignored"; continue
+    fi
     case " $_env_given " in
       *" $name "*) continue ;;
+    esac
+    # A loop limit is kept until the defaults are in, so clamp_project_limits
+    # has something to compare it against.
+    case " $RALPH_PROJECT_LIMITS " in
+      *" $name "*) _project_limits="$_project_limits $name=$value"; continue ;;
     esac
     eval "$name=\$value"
   done < "$file"
@@ -143,6 +188,39 @@ RALPH_LOOP_FAILS="${RALPH_LOOP_FAILS:-2}"
 # running. Two agents trading one bug back and forth is the most expensive way
 # for an unattended loop to achieve nothing.
 RALPH_LOOP_REPEAT="${RALPH_LOOP_REPEAT:-3}"
+
+# Is the value a project asked for at least as strict as the one in effect?
+# Smaller halts sooner for all four: loop.sh compares each counter with -ge,
+# so even 0 is a limit and not an off switch. RALPH_LOOP_MAX is the exception,
+# where 0 means no cap at all and so is looser than any number a project could
+# name.
+limit_is_stricter() {
+  local name="$1" want="$2" have="$3"
+  if [ "$name" = RALPH_LOOP_MAX ]; then
+    [ "$want" = 0 ] && return 1
+    [ "$have" = 0 ] && return 0
+  fi
+  [ "$want" -le "$have" ]
+}
+
+# Now that the defaults are in, let the project tighten them.
+clamp_project_limits() {
+  local pair name want have
+  for pair in $_project_limits; do
+    name="${pair%%=*}"; want="${pair#*=}"
+    eval "have=\$$name"
+    case "$want" in
+      ''|*[!0-9]*)
+        warn "$RALPH_PROJECT_CONFIG: $name must be a whole number -- ignored"; continue ;;
+    esac
+    if limit_is_stricter "$name" "$want" "$have"; then
+      eval "$name=\$want"
+    else
+      warn "$RALPH_PROJECT_CONFIG: a project may only lower $name -- ignored (in effect: $have)"
+    fi
+  done
+}
+clamp_project_limits
 
 # The orchestrator routes and records; the subagents think. Its model is set
 # here because it is the session `ralph loop` starts. The other three live in
