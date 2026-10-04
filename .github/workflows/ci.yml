@@ -140,6 +140,61 @@ jobs:
           out=$(./ralph init --preset nope 2>&1 || true)
           echo "$out" | grep -q "unknown preset"
 
+      - name: Path lists are expanded against the workspace, and a bad one refuses the run
+        run: |
+          mkdir -p /tmp/fakebin
+          cat > /tmp/fakebin/docker <<'SH'
+          #!/usr/bin/env bash
+          echo "docker $*" >> /tmp/docker-calls
+          exit 0
+          SH
+          chmod +x /tmp/fakebin/docker
+
+          rm -rf /tmp/ws /tmp/decoy
+          mkdir -p /tmp/ws/packages/real/node_modules /tmp/decoy/packages/decoy/node_modules
+          echo LIVE=1 > /tmp/ws/.env.production
+          echo LIVE=1 > /tmp/ws/.env
+          echo decoy > /tmp/decoy/.env.foo
+
+          # A glob belongs to the workspace, not to whatever directory `ralph`
+          # was typed in: word splitting a list expands it in the cwd unless
+          # globbing is off while that happens.
+          out=$(cd /tmp/decoy && PATH=/tmp/fakebin:$PATH RALPH_WORKSPACE=/tmp/ws \
+                RALPH_MASK='.env.*' RALPH_ISOLATE='packages/*/node_modules' \
+                "$GITHUB_WORKSPACE/ralph" status 2>&1)
+          echo "$out"
+          echo "$out" | grep -q 'mask          .env.production'
+          echo "$out" | grep -q 'isolate       packages/real/node_modules'
+          if echo "$out" | grep -qE 'decoy|\.env\.foo'; then
+            echo "a path list was expanded in the caller's directory"; exit 1
+          fi
+
+          # A path outside the workspace stops the run outright. The lists are
+          # read inside a loop over the mounts, so a `die` that only exits a
+          # subshell would name the bad path and start the agent anyway, with
+          # the entries before it mounted and the rest silently dropped.
+          rm -f /tmp/docker-calls
+          out=$(PATH=/tmp/fakebin:$PATH RALPH_WORKSPACE=/tmp/ws RALPH_NETWORK_POLICY=off \
+                RALPH_MASK='.env /etc/passwd .env.production' ./ralph shell -lc true 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "must be relative to the workspace"
+          if grep -q 'docker run' /tmp/docker-calls; then
+            echo "a rejected path list still started a container"; exit 1
+          fi
+
+          # Masking is mounting a file over a file, and docker CREATES a bind
+          # source it cannot find -- so a .env.local nobody has is skipped
+          # rather than left behind in the user's own workspace.
+          rm -f /tmp/docker-calls
+          PATH=/tmp/fakebin:$PATH RALPH_WORKSPACE=/tmp/ws RALPH_NETWORK_POLICY=off \
+            RALPH_MASK='.env .env.production .env.local' ./ralph shell -lc true
+          grep -o '/workspace/\.env[^ :]*' /tmp/docker-calls | sort -u
+          grep -q '/workspace/\.env\.production' /tmp/docker-calls
+          if grep -q '/workspace/\.env\.local' /tmp/docker-calls; then
+            echo "masked a file that is not there"; exit 1
+          fi
+          test ! -e /tmp/ws/.env.local
+
   loop:
     runs-on: ubuntu-latest
     steps:

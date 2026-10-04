@@ -107,9 +107,13 @@ Each listed file is mounted over with an empty, read-only file. It reads as
 nothing inside the sandbox, writes to it fail, and the host keeps its own copy
 untouched. Globs are expanded against the workspace, so `.env.*` covers a file
 you forgot -- though it also covers `.env.example`, which the agent may
-legitimately want to read, so listing names is usually better. In `clone` mode
-both the read-only source and the private copy are masked. `ralph status`
-prints what is masked, and prints `mask off` when nothing is.
+legitimately want to read, so listing names is usually better. A name that is
+not in the workspace is skipped: there is nothing to hide, and mounting over
+it would make Docker create it, leaving an empty `.env.local` in a project
+that never had one. In `clone` mode both the read-only source and the private
+copy are masked. `ralph status` prints what is masked, which is the list after
+globs and missing files, so it is also how you check a pattern matched what
+you meant.
 
 This closes one hole rather than drawing a boundary: the same secret may be in
 the git history, in the process environment, or reachable with a mounted

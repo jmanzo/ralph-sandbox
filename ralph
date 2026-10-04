@@ -317,23 +317,46 @@ check_ws_path() {
   esac
 }
 
-# Expand globs against the workspace. A literal entry survives not existing
-# yet -- node_modules on a fresh clone is exactly when isolating it matters --
-# while a glob can only ever match what is already there.
+# Expand globs against the workspace, into _ws_paths. A global array rather
+# than stdout because every caller would otherwise read it through a process
+# substitution, where check_ws_path's die exits that subshell alone: the bad
+# path gets named and the run starts anyway, carrying the entries that came
+# before it and nothing to say the rest were dropped.
+#
+# A literal entry survives not existing yet -- node_modules on a fresh clone
+# is exactly when isolating it matters -- while a glob can only ever match
+# what is already there. Pass `existing` for a list that is mounted over file
+# by file: Docker creates a bind source it cannot find, so an unconditional
+# RALPH_MASK leaves an empty .env.local behind in the user's own workspace.
+_ws_paths=()
 expand_ws_paths() {
-  local list="$1" label="$2" p hit
-  for p in $list; do
+  local list="$1" label="$2" only_existing="${3:-}" p hit
+  _ws_paths=()
+  # Globbing off while the list is split: with it on, word splitting also
+  # expands each entry against the CALLER's directory, and a pattern that
+  # happens to match something there arrives below as a literal that never
+  # reaches the workspace at all -- `ralph` run from a directory holding its
+  # own .env.foo would mask that name and leave the workspace's
+  # .env.production readable.
+  set -f
+  # shellcheck disable=SC2086  # splitting the list is the point
+  set -- $list
+  set +f
+  for p in "$@"; do
     check_ws_path "$p" "$label"
     case "$p" in
       *[*?]*)
-        # Splitting and globbing are the point of this loop.
+        # Globbing is the point of this loop.
         # shellcheck disable=SC2231
         for hit in "$RALPH_WORKSPACE"/$p; do
           [ -e "$hit" ] || continue
-          printf '%s\n' "${hit#"$RALPH_WORKSPACE"/}"
+          _ws_paths+=("${hit#"$RALPH_WORKSPACE"/}")
         done
         ;;
-      *) printf '%s\n' "$p" ;;
+      *)
+        [ -z "$only_existing" ] || [ -e "$RALPH_WORKSPACE/$p" ] || continue
+        _ws_paths+=("$p")
+        ;;
     esac
   done
 }
@@ -786,29 +809,29 @@ cmd_run() {
       # -- nothing masked, no dependency directory of its own.
       [ -n "$RALPH_PROJECT_CONFIG" ] &&
         args+=(-v "$RALPH_PROJECT_CONFIG:/workspace/.ralph/config.env:ro")
-      while IFS= read -r iso_path; do
-        [ -n "$iso_path" ] || continue
+      expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE
+      for iso_path in ${_ws_paths[@]+"${_ws_paths[@]}"}; do
         iso_vol="$(isolate_volume_name "$iso_path")"
         isolate_prepare "$iso_vol" "$iso_path"
         args+=(-v "$iso_vol:/workspace/$iso_path")
-      done < <(expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE)
-      while IFS= read -r mask_path; do
-        [ -n "$mask_path" ] || continue
+      done
+      expand_ws_paths "$RALPH_MASK" RALPH_MASK existing
+      for mask_path in ${_ws_paths[@]+"${_ws_paths[@]}"}; do
         args+=(-v "$(mask_source):/workspace/$mask_path:ro")
-      done < <(expand_ws_paths "$RALPH_MASK" RALPH_MASK)
+      done
       ;;
     clone)
       [ -d "$RALPH_WORKSPACE" ] || die "workspace not a directory: $RALPH_WORKSPACE"
       volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
       args+=(-v "$RALPH_WORKSPACE:/run/sandbox/source:ro" -v "$ws_volume:/workspace")
-      while IFS= read -r mask_path; do
-        [ -n "$mask_path" ] || continue
+      expand_ws_paths "$RALPH_MASK" RALPH_MASK existing
+      for mask_path in ${_ws_paths[@]+"${_ws_paths[@]}"}; do
         mask_file="$(mask_source)"
         # Both ends: the source the private copy is seeded from, and the copy
         # itself, which may have been seeded before masking was turned on.
         args+=(-v "$mask_file:/run/sandbox/source/$mask_path:ro")
         args+=(-v "$mask_file:/workspace/$mask_path:ro")
-      done < <(expand_ws_paths "$RALPH_MASK" RALPH_MASK)
+      done
       ;;
     none)
       volume_exists "$ws_volume" || docker volume create "$ws_volume" >/dev/null
@@ -1080,21 +1103,27 @@ cmd_status() {
   fi
   if [ -n "$RALPH_ISOLATE" ]; then
     if [ "$RALPH_MODE" = "direct" ]; then
-      printf 'isolate       %s  (sandbox keeps its own)\n' \
-        "$(expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE | tr '\n' ' ')"
+      expand_ws_paths "$RALPH_ISOLATE" RALPH_ISOLATE
+      if [ ${#_ws_paths[@]} -eq 0 ]; then
+        printf 'isolate       nothing in the workspace matches %s\n' "$RALPH_ISOLATE"
+      else
+        printf 'isolate       %s  (sandbox keeps its own)\n' "${_ws_paths[*]}"
+      fi
     else
       printf 'isolate       nothing to do in %s mode\n' "$RALPH_MODE"
     fi
   fi
   case "$RALPH_MODE" in
     direct|clone)
-      local masked
-      masked="$(expand_ws_paths "$RALPH_MASK" RALPH_MASK | tr '\n' ' ')"
-      masked="${masked% }"
-      if [ -z "$masked" ]; then
-        printf 'mask          off  (the agent can read every file in the workspace)\n'
+      expand_ws_paths "$RALPH_MASK" RALPH_MASK existing
+      if [ ${#_ws_paths[@]} -gt 0 ]; then
+        printf 'mask          %s  (empty inside the sandbox)\n' "${_ws_paths[*]}"
+      elif [ -n "$RALPH_MASK" ]; then
+        # Set but masking nothing is worth saying out loud: the list is the
+        # one setting whose whole job is to be in effect before a run starts.
+        printf 'mask          no file in the workspace matches %s\n' "$RALPH_MASK"
       else
-        printf 'mask          %s  (empty inside the sandbox)\n' "$masked"
+        printf 'mask          off  (the agent can read every file in the workspace)\n'
       fi
       ;;
   esac
